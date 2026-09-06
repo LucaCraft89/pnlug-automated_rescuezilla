@@ -336,6 +336,13 @@ def get_source_min_bytes(restoreimg_path: str) -> Optional[int]:
 class StepResult:
     ok: bool
     message: str = ""
+    # Set True only by shrink_system_partition_for_backup (and its helpers)
+    # when they actually modified something (filesystem and/or partition
+    # size). Every other StepResult leaves this False. backup() uses it to
+    # decide whether the source disk needs to be grown back afterward —
+    # skipping "already small enough"/unsupported-fs no-ops, which never
+    # touched the disk and must be left exactly as found.
+    changed: bool = False
 
 
 # Rough per-stage progress mapping, shared by the GTK and curses front-ends —
@@ -593,7 +600,7 @@ def _shrink_ext(sys_part: str, disk: str, log: LogFn) -> StepResult:
                                 tail)
 
     _shrink_partition_to(sys_part, disk, target_bytes, log)
-    return StepResult(True, f"Shrunk {sys_part} to ~{target_bytes // (1024**3)}G before backup.")
+    return StepResult(True, f"Shrunk {sys_part} to ~{target_bytes // (1024**3)}G before backup.", changed=True)
 
 
 def _shrink_btrfs(sys_part: str, disk: str, log: LogFn) -> StepResult:
@@ -611,7 +618,7 @@ def _shrink_btrfs(sys_part: str, disk: str, log: LogFn) -> StepResult:
     if rc != 0:
         return StepResult(True, f"{sys_part} likely has more than 20G of data — leaving it at its current size.")
     _shrink_partition_to(sys_part, disk, SHRINK_TARGET_BYTES, log)
-    return StepResult(True, f"Shrunk {sys_part} to ~20G before backup.")
+    return StepResult(True, f"Shrunk {sys_part} to ~20G before backup.", changed=True)
 
 
 def restore(restoreimg_path: str, disk: str, log: LogFn = _noop_log) -> StepResult:
@@ -663,5 +670,27 @@ def backup(source_disk: str, destination_folder: str, log: LogFn = _noop_log,
     # than hunting for a specific log line.
     image_file = os.path.join(destination_folder, "clonezilla-img")
     if rc != 0 and not (os.path.isfile(image_file) and os.path.getsize(image_file) > 0):
-        return _fail_with_tail("Backup failed.", tail)
-    return StepResult(True, "Backup completed successfully.")
+        result = _fail_with_tail("Backup failed.", tail)
+    else:
+        result = StepResult(True, "Backup completed successfully.")
+
+    # The shrink above is only ever meant to make a smaller/faster backup —
+    # it must never leave the machine we just backed up any different than
+    # we found it. Only run this when something was actually shrunk (a
+    # no-op shrink, e.g. "already small enough", never touched the disk and
+    # must be left alone) — regardless of whether the backup itself
+    # succeeded, since we still altered the source disk either way.
+    if shrink.changed:
+        log("Restoring the source disk's partition to its original size...")
+        regrow = grow_system_partition(source_disk, log)
+        if regrow.ok:
+            log("Source disk restored to its original size.")
+        else:
+            warning = (f"IMPORTANT: the source disk's partition could NOT be restored to its "
+                       f"original size after backup ({regrow.message}). The source machine's disk "
+                       f"is now smaller than before this backup — grow it back manually (e.g. with "
+                       f"gparted) before considering this done.")
+            log(warning)
+            result = StepResult(result.ok, (result.message + "\n\n" + warning).strip())
+
+    return result
