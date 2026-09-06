@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""
+PNLUG Rescue — text UI (curses), for when there's no X/GTK available.
+
+Design (see /home/luca/.claude/plans/synchronous-spinning-tiger.md, Phase 3):
+  - Same safety logic as the GUIs (shared pnlug_rescue_lib module) — same
+    disk-safety rules, same auto-detect, same grow behavior.
+  - One tool, a menu at the top for Restore or Backup.
+  - stdlib curses only — no extra dependency, matches why a TUI exists at
+    all (a GTK/X fallback, so it can't itself need GTK/X).
+"""
+import curses
+import os
+import shutil
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pnlug_rescue_lib as lib
+
+
+# ---------------------------------------------------------------------------
+# Small curses building blocks
+# ---------------------------------------------------------------------------
+
+def draw_menu(stdscr, title: str, options: list, preselect: int = 0):
+    """Arrow keys + Enter to pick one of `options` (list of strings).
+    Returns the selected index, or None if the user pressed q/Escape."""
+    curses.curs_set(0)
+    idx = preselect
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 2, title[: w - 4], curses.A_BOLD)
+        for i, opt in enumerate(options):
+            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            stdscr.addstr(2 + i, 4, opt[: w - 8], attr)
+        stdscr.addstr(h - 1, 2, "↑/↓ move   Enter select   q quit"[: w - 4], curses.A_DIM)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord('k')):
+            idx = (idx - 1) % len(options)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            idx = (idx + 1) % len(options)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return idx
+        elif key in (ord('q'), 27):
+            return None
+
+
+def draw_confirm(stdscr, question: str, detail_lines: list) -> bool:
+    """Yes/No prompt. Returns True only if the user explicitly picks Yes."""
+    options = ["No", "Yes"]
+    idx = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(1, 2, question[: w - 4], curses.A_BOLD)
+        row = 3
+        for line in detail_lines:
+            stdscr.addstr(row, 2, line[: w - 4])
+            row += 1
+        row += 1
+        for i, opt in enumerate(options):
+            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            stdscr.addstr(row, 4 + i * 10, opt, attr)
+        stdscr.addstr(h - 1, 2, "←/→ move   Enter select"[: w - 4], curses.A_DIM)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord('h'), ord('l'), 9):
+            idx = 1 - idx
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return idx == 1
+        elif key in (ord('q'), 27):
+            return False
+
+
+def draw_folder_browser(stdscr, start_dir: str) -> str:
+    """Minimal directory browser: navigate with arrows/Enter, 'u' selects
+    the current directory. Returns the chosen path, or None if cancelled."""
+    current = os.path.abspath(start_dir)
+    idx = 0
+    while True:
+        try:
+            entries = sorted(e for e in os.listdir(current)
+                              if os.path.isdir(os.path.join(current, e)))
+        except PermissionError:
+            entries = []
+        rows = [".. (up)"] + entries
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 2, f"Browsing: {current}"[: w - 4], curses.A_BOLD)
+        visible = h - 4
+        top = max(0, idx - visible + 1)
+        for i, name in enumerate(rows[top:top + visible]):
+            attr = curses.A_REVERSE if top + i == idx else curses.A_NORMAL
+            stdscr.addstr(2 + i, 4, name[: w - 8], attr)
+        stdscr.addstr(h - 1, 2, "↑/↓ move  Enter open  u use this folder  q cancel"[: w - 4], curses.A_DIM)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord('k')):
+            idx = (idx - 1) % len(rows)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            idx = (idx + 1) % len(rows)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if idx == 0:
+                current = os.path.dirname(current) or "/"
+            else:
+                current = os.path.join(current, rows[idx])
+            idx = 0
+        elif key == ord('u'):
+            return current
+        elif key in (ord('q'), 27):
+            return None
+
+
+class LogPane:
+    """Scrolling log lines + a coarse progress percentage, redrawn live as a
+    background worker calls .log(line)."""
+
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.lines = []
+        self.fraction = 0.0
+        self.lock = threading.Lock()
+
+    def log(self, line: str):
+        print(line, flush=True)  # also on stdout, for debugging
+        with self.lock:
+            self.lines.append(line)
+            for marker, fraction in lib.STAGE_MARKERS:
+                if marker in line:
+                    self.fraction = fraction
+                    break
+
+    def redraw_loop(self, stop_event: threading.Event):
+        while not stop_event.is_set():
+            self._draw()
+            time.sleep(0.2)
+        self._draw()
+
+    def _draw(self):
+        h, w = self.stdscr.getmaxyx()
+        with self.lock:
+            pct = int(self.fraction * 100)
+            bar_w = max(10, w - 10)
+            filled = int(bar_w * self.fraction)
+            bar = "[" + "#" * filled + "-" * (bar_w - filled) + f"] {pct}%"
+            visible = self.lines[-(h - 3):]
+        self.stdscr.erase()
+        self.stdscr.addstr(0, 1, bar[: w - 2])
+        for i, line in enumerate(visible):
+            try:
+                self.stdscr.addstr(2 + i, 1, line[: w - 2])
+            except curses.error:
+                pass  # last row/col can raise; harmless to skip
+        self.stdscr.refresh()
+
+
+def run_with_log(stdscr, worker_fn) -> "lib.StepResult":
+    """Run `worker_fn(log_fn)` in a background thread while redrawing a
+    LogPane in the foreground. On completion, feeds the result message
+    (which includes real command-output detail on failure — see
+    lib._fail_with_tail) into the same visible log before returning, so
+    "it failed" always comes with the actual output the user just watched,
+    not a bare one-line verdict on a blank screen."""
+    pane = LogPane(stdscr)
+    stop_event = threading.Event()
+    result_box = {}
+
+    def target():
+        result_box["result"] = worker_fn(pane.log)
+        stop_event.set()
+
+    threading.Thread(target=target, daemon=True).start()
+    pane.redraw_loop(stop_event)
+    result = result_box["result"]
+    pane.log("")
+    for line in result.message.splitlines():
+        pane.log(line)
+    pane._draw()
+    return result
+
+
+def draw_done(stdscr, ok: bool, message: str):
+    """Standalone result screen (no log behind it — used for early-exit
+    errors like 'no restoreimg found' or 'no candidate disks')."""
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    icon = "OK" if ok else "!!"
+    stdscr.addstr(2, 2, f"[{icon}]"[: w - 4], curses.A_BOLD)
+    for i, line in enumerate(message.splitlines()):
+        stdscr.addstr(2 + i, 6, line[: w - 8])
+    idx = draw_menu(stdscr, "", ["Restart now", "Close"], preselect=1)
+    if idx == 0:
+        lib._run(["reboot"])
+
+
+def prompt_after_log(stdscr, ok: bool):
+    """Restart/Close prompt after a run_with_log operation — the result
+    (including any failure detail) is already visible in the log above, so
+    this doesn't erase the screen, just adds the final choice."""
+    h, w = stdscr.getmaxyx()
+    icon = "OK" if ok else "!!"
+    stdscr.addstr(h - 1, 1, f"[{icon}] see log above — press a key to continue"[: w - 2], curses.A_BOLD)
+    stdscr.refresh()
+    stdscr.getch()
+    idx = draw_menu(stdscr, "", ["Restart now", "Close"], preselect=1)
+    if idx == 0:
+        lib._run(["reboot"])
+
+
+# ---------------------------------------------------------------------------
+# Shared disk-picking flow
+# ---------------------------------------------------------------------------
+
+def pick_disk(stdscr, prompt: str, exclude_disk_name, for_backup: bool = False):
+    stdscr.erase()
+    stdscr.addstr(1, 2, "Checking disks (and what's currently on them)...", curses.A_BOLD)
+    stdscr.refresh()
+    disks = lib.list_candidate_disks(exclude_disk_name=exclude_disk_name)
+    if not disks:
+        draw_done(stdscr, False, "No candidate disks found (or only the Ventoy drive is present).")
+        return None
+    recommend_fn = lib.recommend_disk_for_backup if for_backup else lib.recommend_disk
+    recommended = recommend_fn(disks)
+    options = []
+    for d in disks:
+        label = f"{d.path} — {d.label} — {d.size_human}"
+        if d is recommended:
+            label += "  (recommended)"
+        options.append(label)
+    preselect = disks.index(recommended) if recommended in disks else 0
+    idx = draw_menu(stdscr, prompt, options, preselect=preselect)
+    if idx is None:
+        return None
+    return disks[idx]
+
+
+def find_or_browse_ventoy(stdscr, need_restoreimg: bool):
+    """Returns (mount_path, restoreimg_or_destination_path, ventoy_disk_name)
+    or (None, None, None) if the user cancels the manual fallback."""
+    stdscr.erase()
+    stdscr.addstr(1, 2, "Looking for the Ventoy drive...", curses.A_BOLD)
+    stdscr.refresh()
+    data_part = lib.find_ventoy_partition()
+    if data_part:
+        ventoy_disk_name = lib.get_ventoy_disk_name(data_part)
+        mnt = lib.mount_ventoy_partition(data_part)
+        restoreimg = os.path.join(mnt, "restoreimg")
+        if not need_restoreimg or os.path.isdir(restoreimg):
+            return mnt, restoreimg, ventoy_disk_name
+    # Manual fallback: the user browses directly to the folder holding the
+    # backup content (mirrors the GTK apps' browse fallback) — there's no
+    # extra "restoreimg" subfolder to append here.
+    folder = draw_folder_browser(stdscr, "/mnt" if data_part else "/")
+    if folder is None:
+        return None, None, None
+    return folder, folder, None
+
+
+# ---------------------------------------------------------------------------
+# Restore flow
+# ---------------------------------------------------------------------------
+
+def do_restore(stdscr):
+    _, restoreimg_path, ventoy_disk_name = find_or_browse_ventoy(stdscr, need_restoreimg=True)
+    if restoreimg_path is None:
+        return
+    if not os.path.isdir(restoreimg_path):
+        draw_done(stdscr, False, f"No restoreimg/ found at {restoreimg_path}.")
+        return
+
+    disk = pick_disk(stdscr, "Select the disk to restore onto (Ventoy drive hidden for safety):",
+                      ventoy_disk_name)
+    if disk is None:
+        return
+
+    size_check = lib.check_destination_size(restoreimg_path, disk)
+    if not size_check.ok:
+        draw_done(stdscr, False, size_check.message)
+        return
+
+    detail = [f"Model: {disk.model or 'unknown'}"]
+    if disk.distro:
+        detail.append(f"Currently has: {disk.distro}")
+    detail += [f"Size: {disk.size_human}", "",
+               "All data currently on this disk will be permanently lost."]
+    if not draw_confirm(stdscr, f"Completely wipe {disk.path} and restore onto it?", detail):
+        return
+
+    result = run_with_log(stdscr, lambda log: lib.restore(restoreimg_path, disk.path, log))
+    prompt_after_log(stdscr, result.ok)
+
+
+# ---------------------------------------------------------------------------
+# Backup flow
+# ---------------------------------------------------------------------------
+
+def do_backup(stdscr):
+    _, destination, ventoy_disk_name = find_or_browse_ventoy(stdscr, need_restoreimg=False)
+    if destination is None:
+        return
+    # Browsed folders are a directory to hold the backup in; the actual
+    # target is a "restoreimg" subfolder, same convention the restore side
+    # expects (mirrors the GUI backup app).
+    if not destination.endswith("restoreimg"):
+        destination = os.path.join(destination, "restoreimg")
+
+    disk = pick_disk(stdscr, "Select the disk to back up (Ventoy drive hidden for safety):",
+                      ventoy_disk_name, for_backup=True)
+    if disk is None:
+        return
+
+    replacing = os.path.isdir(destination)
+    detail = [f"Model: {disk.model or 'unknown'}"]
+    if disk.distro:
+        detail.append(f"Currently has: {disk.distro}")
+    detail += [f"Size: {disk.size_human}", f"Destination: {destination}"]
+    if replacing:
+        detail += ["", "A backup already exists there and will be replaced."]
+    if not draw_confirm(stdscr, f"Back up {disk.path}?", detail):
+        return
+
+    def worker(log):
+        if os.path.isdir(destination):
+            log(f"Removing existing backup at {destination}...")
+            shutil.rmtree(destination)
+        return lib.backup(disk.path, destination, log=log,
+                           description=lib.describe_disk_for_backup(disk))
+
+    result = run_with_log(stdscr, worker)
+    prompt_after_log(stdscr, result.ok)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(stdscr):
+    curses.curs_set(0)
+    while True:
+        idx = draw_menu(stdscr, "PNLUG Rescue", ["Restore", "Backup", "Quit"])
+        if idx is None or idx == 2:
+            return
+        try:
+            (do_restore if idx == 0 else do_backup)(stdscr)
+        except Exception as exc:  # noqa: BLE001 - never crash out of curses uncleanly
+            draw_done(stdscr, False, f"Unexpected error: {exc}")
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)

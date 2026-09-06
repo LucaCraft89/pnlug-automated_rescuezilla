@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+
+[Desktop Entry]
+Version=1.0
+Type=Application
+Exec=python3 /usr/bin/pnlug-rescue-gui
+Terminal=false
+Name=PNLUG Restore
+Comment=Restore a Rescuezilla backup from the Ventoy drive (GUI)
+Icon=pnluglogo.png

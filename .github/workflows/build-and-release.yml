@@ -1,0 +1,59 @@
+name: Build and Release
+
+# Watches upstream Rescuezilla for a new release and, if this repo hasn't
+# already published one for it, builds the PNLUG ISO with build/build.sh and
+# publishes it as a new GitHub Release here. See docs/build-guide.md for the
+# full explanation — this file is deliberately short: almost all the real
+# work already lives in build.sh/remaster.sh, so CI only adds the version
+# check and the publish step around them.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"   # once a day; upstream releases aren't frequent
+  workflow_dispatch: {}     # "Run workflow" button, for on-demand builds
+
+permissions:
+  contents: write   # to create releases
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream Rescuezilla release
+        id: check
+        run: |
+          tag=$(curl -fsSL https://api.github.com/repos/rescuezilla/rescuezilla/releases/latest | jq -r .tag_name)
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "rescuezilla-$tag" >/dev/null 2>&1; then
+            echo "already_built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_built=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Podman
+        if: steps.check.outputs.already_built == 'false'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq podman
+
+      - name: Build ISO
+        if: steps.check.outputs.already_built == 'false'
+        run: build/build.sh noble
+
+      - name: Package ventoy/ folder
+        if: steps.check.outputs.already_built == 'false'
+        run: (cd build/output && zip -r ventoy.zip ventoy)
+
+      - name: Publish release
+        if: steps.check.outputs.already_built == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="rescuezilla-${{ steps.check.outputs.upstream_tag }}"
+          gh release create "$tag" \
+            build/output/pnlug_zilla.iso \
+            build/output/ventoy.zip \
+            --title "PNLUG Rescuezilla ($tag)" \
+            --notes "Automatically built from [Rescuezilla ${{ steps.check.outputs.upstream_tag }}](https://github.com/rescuezilla/rescuezilla/releases/tag/${{ steps.check.outputs.upstream_tag }}) — see that release for Rescuezilla's own corresponding source and changelog. See the [Usage Guide](../../blob/main/docs/usage-guide.md) for how to put these files on a Ventoy stick."

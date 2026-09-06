@@ -1,0 +1,389 @@
+{
+    "control":[
+        { "VTOY_DEFAULT_KBD_LAYOUT": "ITALIANO" },
+        { "VTOY_MENU_TIMEOUT": "3" },
+        { "VTOY_DEFAULT_IMAGE": "/pnlug_zilla.iso" }
+    ],
+    "theme":{
+        "file": "/ventoy/theme/pnlug/theme.txt",
+        "gfxmode": "max",
+        "fonts":[
+            "/ventoy/theme/pnlug/terminus-12.pf2",
+            "/ventoy/theme/pnlug/terminus-14.pf2",
+            "/ventoy/theme/pnlug/terminus-16.pf2",
+            "/ventoy/theme/pnlug/terminus-18.pf2",
+            "/ventoy/theme/pnlug/roboto_17.pf2",
+            "/ventoy/theme/pnlug/roboto_20.pf2"
+        ]
+    },
+    "theme_legacy":{
+        "file": "/ventoy/theme/pnlug_legacy/theme.txt",
+        "gfxmode": "max",
+        "fonts":[
+            "/ventoy/theme/pnlug_legacy/terminus-12.pf2",
+            "/ventoy/theme/pnlug_legacy/terminus-14.pf2",
+            "/ventoy/theme/pnlug_legacy/terminus-16.pf2",
+            "/ventoy/theme/pnlug_legacy/terminus-18.pf2",
+            "/ventoy/theme/pnlug_legacy/roboto_17.pf2",
+            "/ventoy/theme/pnlug_legacy/roboto_20.pf2"
+        ]
+    },
+    "theme_uefi":{
+        "file": "/ventoy/theme/pnlug_UEFI/theme.txt",
+        "gfxmode": "max",
+        "fonts":[
+            "/ventoy/theme/pnlug_UEFI/terminus-12.pf2",
+            "/ventoy/theme/pnlug_UEFI/terminus-14.pf2",
+            "/ventoy/theme/pnlug_UEFI/terminus-16.pf2",
+            "/ventoy/theme/pnlug_UEFI/terminus-18.pf2",
+            "/ventoy/theme/pnlug_UEFI/roboto_17.pf2",
+            "/ventoy/theme/pnlug_UEFI/roboto_20.pf2"
+        ]
+    },
+    "menu_class":[
+        {
+            "key": "4MLinux",
+            "class": "4mlinux"
+        },
+        {
+            "key": "alma",
+            "class": "alma"
+        },
+        {
+            "key": "AlpineLinux",
+            "class": "alpinelinux"
+        },
+        {
+            "key": "android",
+            "class": "android"
+        },
+        {
+            "key": "anonymous",
+            "class": "anonymous"
+        },
+        {
+            "key": "antergos",
+            "class": "antergos"
+        },
+        {
+            "key": "arch",
+            "class": "arch"
+        },
+        {
+            "key": "archcraft",
+            "class": "archcraft"
+        },
+        {
+            "key": "archlinux",
+            "class": "archlinux"
+        },
+        {
+            "key": "arcolinux",
+            "class": "arcolinux"
+        },
+        {
+            "key": "artix",
+            "class": "artix"
+        },
+        {
+            "key": "bedrock",
+            "class": "bedrock"
+        },
+        {
+            "key": "cancel",
+            "class": "cancel"
+        },
+        {
+            "key": "centos",
+            "class": "centos"
+        },
+        {
+            "key": "chakra",
+            "class": "chakra"
+        },
+        {
+            "key": "chromeos",
+            "class": "chromeos"
+        },
+        {
+            "key": "debian",
+            "class": "debian"
+        },
+        {
+            "key": "deepin",
+            "class": "deepin"
+        },
+        {
+            "key": "devuan",
+            "class": "devuan"
+        },
+        {
+            "key": "driver",
+            "class": "driver"
+        },
+        {
+            "key": "edit",
+            "class": "edit"
+        },
+        {
+            "key": "efi",
+            "class": "efi"
+        },
+        {
+            "key": "elementary",
+            "class": "elementary"
+        },
+        {
+            "key": "endeavouros",
+            "class": "endeavouros"
+        },
+        {
+            "key": "fedora",
+            "class": "fedora"
+        },
+        {
+            "key": "find.efi",
+            "class": "find.efi"
+        },
+        {
+            "key": "find.none",
+            "class": "find.none"
+        },
+        {
+            "key": "freebsd",
+            "class": "freebsd"
+        },
+        {
+            "key": "garuda",
+            "class": "garuda"
+        },
+        {
+            "key": "gentoo",
+            "class": "gentoo"
+        },
+        {
+            "key": "gnu-linux",
+            "class": "gnu-linux"
+        },
+        {
+            "key": "haiku",
+            "class": "haiku"
+        },
+        {
+            "key": "help",
+            "class": "help"
+        },
+        {
+            "key": "kali",
+            "class": "kali"
+        },
+        {
+            "key": "kaos",
+            "class": "kaos"
+        },
+        {
+            "key": "kbd",
+            "class": "kbd"
+        },
+        {
+            "key": "korora",
+            "class": "korora"
+        },
+        {
+            "key": "lang",
+            "class": "lang"
+        },
+        {
+            "key": "lfs",
+            "class": "lfs"
+        },
+        {
+            "key": "genericlinux",
+            "class": "linux"
+        },
+        {
+            "key": "linuxlite",
+            "class": "linuxlite"
+        },
+        {
+            "key": "linuxmint",
+            "class": "linuxmint"
+        },
+        {
+            "key": "lubuntu",
+            "class": "lubuntu"
+        },
+        {
+            "key": "macosx",
+            "class": "macosx"
+        },
+        {
+            "key": "mageia",
+            "class": "mageia"
+        },
+        {
+            "key": "Manjaro.i686",
+            "class": "manjaro.i686"
+        },
+        {
+            "key": "manjaro",
+            "class": "manjaro"
+        },
+        {
+            "key": "Manjaro.x86_64",
+            "class": "manjaro.x86_64"
+        },
+        {
+            "key": "mate",
+            "class": "mate"
+        },
+        {
+            "key": "memtest",
+            "class": "memtest"
+        },
+        {
+            "key": "mx-linux",
+            "class": "mx-linux"
+        },
+        {
+            "key": "neon",
+            "class": "neon"
+        },
+        {
+            "key": "nix",
+            "class": "nix"
+        },
+        {
+            "key": "nixos",
+            "class": "nixos"
+        },
+        {
+            "key": "nobara",
+            "class": "nobara"
+        },
+        {
+            "key": "opensuse",
+            "class": "opensuse"
+        },
+        {
+            "key": "parabola",
+            "class": "parabola"
+        },
+        {
+            "key": "parrot",
+            "class": "parrot"
+        },
+        {
+            "key": "pop-os",
+            "class": "pop-os"
+        },
+        {
+            "key": "pop",
+            "class": "pop"
+        },
+        {
+            "key": "recovery",
+            "class": "recovery"
+        },
+        {
+            "key": "regolith",
+            "class": "regolith"
+        },
+        {
+            "key": "restart",
+            "class": "restart"
+        },
+        {
+            "key": "rocky",
+            "class": "rocky"
+        },
+        {
+            "key": "shutdown",
+            "class": "shutdown"
+        },
+        {
+            "key": "siduction",
+            "class": "siduction"
+        },
+        {
+            "key": "silverblue",
+            "class": "silverblue"
+        },
+        {
+            "key": "slackware",
+            "class": "slackware"
+        },
+        {
+            "key": "solus",
+            "class": "solus"
+        },
+        {
+            "key": "steamos",
+            "class": "steamos"
+        },
+        {
+            "key": "SystemRescueCD",
+            "class": "systemrescuecd"
+        },
+        {
+            "key": "type",
+            "class": "type"
+        },
+        {
+            "key": "tz",
+            "class": "tz"
+        },
+        {
+            "key": "ubuntu",
+            "class": "ubuntu"
+        },
+        {
+            "key": "ultramarine",
+            "class": "ultramarine"
+        },
+        {
+            "key": "unknown",
+            "class": "unknown"
+        },
+        {
+            "key": "unset",
+            "class": "unset"
+        },
+        {
+            "key": "vanillaos",
+            "class": "vanillaos"
+        },
+        {
+            "key": "ventoy",
+            "class": "ventoy"
+        },
+        {
+            "key": "void",
+            "class": "void"
+        },
+        {
+            "key": "windows",
+            "class": "windows"
+        },
+        {
+            "key": "Win11",
+            "class": "windows11"
+        },
+        {
+            "key": "xero",
+            "class": "xero"
+        },
+        {
+            "key": "xerolinux",
+            "class": "xerolinux"
+        },
+        {
+            "key": "xubuntu",
+            "class": "xubuntu"
+        },
+        {
+            "key": "zorin",
+            "class": "zorin"
+        }
+    ]
+}

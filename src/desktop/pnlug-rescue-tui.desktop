@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+
+[Desktop Entry]
+Version=1.0
+Type=Application
+Exec=xfce4-terminal --hold -e "python3 /usr/bin/pnlug-rescue-tui"
+Terminal=false
+Name=PNLUG Rescue (Terminal)
+Comment=Restore or back up via a text menu — for when the GUI isn't available
+Icon=pnluglogo.png

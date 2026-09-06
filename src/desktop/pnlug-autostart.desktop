@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Exec=/usr/bin/pnlug-autostart.sh
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+Name=PNLUG Auto Rescue (autostart)
+Comment=Launches the restore GUI at desktop load; falls back to the TUI if it can't start

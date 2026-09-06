@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+PNLUG Rescue — restore GUI.
+
+Design (see /home/luca/.claude/plans/synchronous-spinning-tiger.md, Phase 2):
+  - Maximized window, logo, full log always visible.
+  - Auto-detects restoreimg/ on the Ventoy drive; falls back to a folder
+    browser rooted at the drive if not found.
+  - Disk list excludes the Ventoy drive itself; recommends + pre-selects
+    the most likely internal disk.
+  - Modal double-check before anything destructive.
+  - Progress bar + streaming log during restore/grow.
+  - Offers to reboot when done.
+"""
+import os
+import sys
+import threading
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pnlug_rescue_lib as lib
+import pnlug_gui_common as gui
+
+
+class RescueWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="PNLUG Auto Rescue")
+        self.connect("destroy", Gtk.main_quit)
+        self.maximize()
+
+        self.ventoy_disk_name = None
+        self.restoreimg_path = None
+        self.disks = []
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(root)
+        root.pack_start(gui.build_header("PNLUG Auto Rescue"), False, False, 0)
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        root.pack_start(self.stack, True, True, 0)
+
+        self._build_detect_page()
+        self._build_browse_page()
+        self._build_disks_page()
+
+        self.progress_page = gui.ProgressPage()
+        self.stack.add_named(self.progress_page, "progress")
+
+        self.stack.set_visible_child_name("detect")
+        GLib.idle_add(self._start_detect)
+
+    # ---------------------------------------------------------- detect page
+    def _build_detect_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                       halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        spinner = Gtk.Spinner()
+        spinner.start()
+        box.pack_start(spinner, False, False, 0)
+        self.detect_label = Gtk.Label(label="Looking for a Rescuezilla backup on the Ventoy drive...")
+        box.pack_start(self.detect_label, False, False, 0)
+        self.stack.add_named(box, "detect")
+
+    def _start_detect(self):
+        threading.Thread(target=self._detect_worker, daemon=True).start()
+        return False
+
+    def _detect_worker(self):
+        data_part = lib.find_ventoy_partition()
+        if data_part:
+            self.ventoy_disk_name = lib.get_ventoy_disk_name(data_part)
+            mnt = lib.mount_ventoy_partition(data_part)
+            restoreimg = os.path.join(mnt, "restoreimg")
+            if os.path.isdir(restoreimg):
+                GLib.idle_add(self._on_restoreimg_found, restoreimg)
+                return
+            GLib.idle_add(self._on_need_browse, mnt)
+        else:
+            GLib.idle_add(self._on_need_browse, "/")
+
+    def _on_restoreimg_found(self, restoreimg_path):
+        self.restoreimg_path = restoreimg_path
+        self._populate_disks()
+        return False
+
+    def _on_need_browse(self, start_dir):
+        self.browser.set_current_folder(start_dir)
+        self.stack.set_visible_child_name("browse")
+        return False
+
+    # ---------------------------------------------------------- browse page
+    def _build_browse_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        box.pack_start(Gtk.Label(
+            label="Couldn't find restoreimg/ automatically — pick the folder with the backup:",
+            xalign=0), False, False, 0)
+        self.browser = Gtk.FileChooserWidget(action=Gtk.FileChooserAction.SELECT_FOLDER)
+        box.pack_start(self.browser, True, True, 0)
+        confirm = Gtk.Button(label="Use this folder")
+        confirm.connect("clicked", self._on_browse_confirm)
+        box.pack_start(confirm, False, False, 0)
+        self.stack.add_named(box, "browse")
+
+    def _on_browse_confirm(self, _btn):
+        folder = self.browser.get_filename()
+        if folder:
+            self.restoreimg_path = folder
+            self._populate_disks()
+
+    # ----------------------------------------------------------- disks page
+    def _build_disks_page(self):
+        box, self.disk_list = gui.build_disk_list_page(self._on_disk_continue)
+        box.pack_start(Gtk.Label(
+            label="Select the disk to restore onto (the Ventoy drive is hidden for safety):",
+            xalign=0), False, False, 0)
+        box.reorder_child(box.get_children()[-1], 0)
+        self.stack.add_named(box, "disks")
+
+    def _populate_disks(self):
+        # Enumerating disks also probes each partition for a distro name
+        # (see lib.detect_distro_name) — confirmed in testing that doing
+        # this on the GTK main thread freezes the whole window for the
+        # duration, so it runs in a background thread like the initial
+        # Ventoy detection does.
+        self.detect_label.set_text("Checking disks (and what's currently on them)...")
+        self.stack.set_visible_child_name("detect")
+        threading.Thread(target=self._populate_disks_worker, daemon=True).start()
+
+    def _populate_disks_worker(self):
+        disks = lib.list_candidate_disks(exclude_disk_name=self.ventoy_disk_name)
+        recommended = lib.recommend_disk(disks)
+        GLib.idle_add(self._on_disks_ready, disks, recommended)
+
+    def _on_disks_ready(self, disks, recommended):
+        self.disks = disks
+        gui.populate_disk_list(self.disk_list, self.disks, recommended)
+        self.stack.set_visible_child_name("disks")
+        return False
+
+    def _on_disk_continue(self, _btn):
+        row = self.disk_list.get_selected_row()
+        if not row:
+            return
+        disk = row.disk
+        size_check = lib.check_destination_size(self.restoreimg_path, disk)
+        if not size_check.ok:
+            gui.error_dialog(self, size_check.message)
+            return
+        if not gui.confirm_dialog(self, f"Completely wipe {disk.path} and restore onto it?", disk,
+                                   "All data currently on this disk will be permanently lost."):
+            return
+        self.stack.set_visible_child_name("progress")
+        threading.Thread(target=self._restore_worker, args=(disk,), daemon=True).start()
+
+    # -------------------------------------------------------------- worker
+    def _restore_worker(self, disk: "lib.Disk"):
+        try:
+            result = lib.restore(self.restoreimg_path, disk.path, log=self.progress_page.log_threadsafe)
+        except Exception as exc:  # noqa: BLE001 - last-resort guard, never crash silently
+            self.progress_page.log_threadsafe(f"Unexpected error: {exc}")
+            result = lib.StepResult(False, f"Unexpected error: {exc}")
+        GLib.idle_add(self._on_restore_done, result)
+
+    def _on_restore_done(self, result: "lib.StepResult"):
+        self.progress_page.show_result(result.ok, result.message)
+        return False
+
+
+def main():
+    win = RescueWindow()
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

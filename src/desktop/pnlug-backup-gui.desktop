@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+
+[Desktop Entry]
+Version=1.0
+Type=Application
+Exec=python3 /usr/bin/pnlug-backup-gui
+Terminal=false
+Name=PNLUG Backup
+Comment=Back up a disk to the Ventoy drive (GUI)
+Icon=pnluglogo.png
