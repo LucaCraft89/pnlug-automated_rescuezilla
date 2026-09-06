@@ -35,6 +35,7 @@ docs/           The guides linked above.
 
 ## Quick start
 
+- **Just want the files?** → **[Latest release](../../releases/latest)** (`pnlug_zilla.iso` + `ventoy.zip`) — no need to clone or build anything.
 - **Just want to use an existing PNLUG rescue stick?** → [Usage Guide](docs/usage-guide.md)
 - **Want to build your own stick from scratch, or rebuild after a Rescuezilla update?** → [Build Guide](docs/build-guide.md)
 - **Curious how/why this was built?** → [How It's Done](docs/how-its-done.md)

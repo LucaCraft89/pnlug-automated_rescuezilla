@@ -38,6 +38,7 @@ docs/           Le guide linkate sopra.
 
 ## Avvio rapido
 
+- **Vuoi solo i file?** → **[Ultima release](../../releases/latest)** (`pnlug_zilla.iso` + `ventoy.zip`) — non serve clonare né compilare nulla.
 - **Vuoi solo usare una chiavetta di ripristino PNLUG già pronta?** → [Guida all'uso](docs/usage-guide.it.md)
 - **Vuoi costruire la tua chiavetta da zero, o ricompilare dopo un aggiornamento di Rescuezilla?** → [Guida alla compilazione](docs/build-guide.it.md)
 - **Curioso di sapere come/perché è stato realizzato?** → [Come è stato fatto](docs/how-its-done.it.md)
