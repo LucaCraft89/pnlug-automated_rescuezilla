@@ -107,6 +107,23 @@ def get_ventoy_disk_name(data_part_path: str) -> Optional[str]:
     return lines[0] if lines else None
 
 
+def _unmount_retry(mnt: str, attempts: int = 3, delay: float = 0.5) -> None:
+    """Best-effort unmount with a couple of retries, falling back to a lazy
+    unmount. Confirmed live in testing: a plain `umount` can transiently
+    fail (kernel still settling right after a partition table change/
+    resize elsewhere on the same disk) — an unnoticed failure here used to
+    leave the mountpoint alive for tempfile.TemporaryDirectory's own
+    cleanup to trip over: shutil.rmtree hitting real files on a
+    still-mounted, read-only filesystem ("Read-only file system:
+    'mboot.c32'", "...: 'exec'" — different files, same root cause,
+    whichever partition happened to be mounted there at the time)."""
+    for _ in range(attempts):
+        if _run(["umount", mnt]).returncode == 0:
+            return
+        time.sleep(delay)
+    _run(["umount", "-l", mnt])  # lazy: detach now, finishes once nothing's using it
+
+
 def detect_distro_name(disk_path: str) -> str:
     """Best-effort distro name off a disk, read from /etc/os-release
     (PRETTY_NAME) on whichever partition has one. Empty string if none
@@ -127,7 +144,7 @@ def detect_distro_name(disk_path: str) -> str:
                     if m:
                         return m[1].strip()
             finally:
-                _run(["umount", mnt])
+                _unmount_retry(mnt)
     return ""
 
 
@@ -246,7 +263,7 @@ def find_ventoy_partition(retries: int = 3, retry_delay: float = 1.0) -> Optiona
                     if looks_like_ventoy_partition(scan_mnt):
                         return candidate
                 finally:
-                    _run(["umount", scan_mnt])
+                    _unmount_retry(scan_mnt)
             if attempt < retries - 1:
                 time.sleep(retry_delay)
     return None
@@ -284,7 +301,7 @@ def find_system_partition(disk: str) -> Optional[str]:
                 if has_fstab and has_bin:
                     return part
             finally:
-                _run(["umount", mnt])
+                _unmount_retry(mnt)
     return None
 
 
@@ -644,7 +661,7 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log,
                 ok = rc == 0
             else:
                 ok, tail = False, []
-            _run(["umount", tmp])
+            _unmount_retry(tmp)
     elif fs_type == "xfs":
         with tempfile.TemporaryDirectory() as tmp:
             if _run(["mount", sys_part, tmp]).returncode == 0:
@@ -652,7 +669,7 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log,
                 ok = rc == 0
             else:
                 ok, tail = False, []
-            _run(["umount", tmp])
+            _unmount_retry(tmp)
     else:
         return StepResult(False, f"Unsupported filesystem type '{fs_type}' — partition grown, filesystem not resized.")
 
@@ -846,7 +863,7 @@ def _shrink_btrfs(sys_part: str, disk: str, log: LogFn,
                                        str(SHRINK_TARGET_BYTES // (1024*1024)) + "M", tmp], log,
                                       abort_check=_make_abort_check(cancel_event))
         finally:
-            _run(["umount", tmp])
+            _unmount_retry(tmp)
     if rc != 0:
         return StepResult(True, f"{sys_part} likely has more than 20G of data — leaving it at its current size.")
     _shrink_partition_to(sys_part, disk, SHRINK_TARGET_BYTES, log)
@@ -870,6 +887,14 @@ def restore(restoreimg_path: str, disk: str, log: LogFn = _noop_log,
             tail)
     log("Restore reported success.")
     _run(["partprobe", disk])
+    # Confirmed live in testing: partprobe returning doesn't guarantee the
+    # kernel/udev have actually finished creating the new partition device
+    # nodes yet — grow_system_partition's find_system_partition() call right
+    # after this raced that and came back empty-handed ("Could not identify
+    # a Linux system partition"), even though the exact same call succeeded
+    # moments later in check_restored_filesystem(). udevadm settle blocks
+    # until pending udev events are processed, closing the race.
+    _run(["udevadm", "settle", "--timeout=10"])
 
     try:
         grow = grow_system_partition(disk, log, cancel_event=cancel_event)
