@@ -473,6 +473,13 @@ _PARTCLONE_RE = re.compile(
 # Fallback for tools with no elapsed/remaining/rate, just a trailing percentage
 # (e.g. `resize2fs -p`) — used only to drive a stage's own %, no speed/ETA.
 _PERCENT_ONLY_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+# resize2fs -p's own progress format, confirmed live on a real shrink —
+# turns out to be a fixed-width dash/X text bar, no digit/percent text at
+# all ("Relocating blocks             ----------XXXXXXXXXX"), so
+# _PERCENT_ONLY_RE never matches any of it and the stage bar just sat at
+# 0% the whole time despite the log clearly moving. {10,} is a floor
+# against matching some unrelated short run of dashes by accident.
+_RESIZE2FS_BAR_RE = re.compile(r"^[A-Za-z][\w ]*?\s{2,}([-X]{10,})\s*$")
 
 
 def _hms_to_seconds(h: str, m: str, s: str) -> int:
@@ -492,10 +499,17 @@ def parse_partclone_progress(line: str) -> Optional[PartcloneProgress]:
 
 
 def parse_percent_only(line: str) -> Optional[float]:
-    """Last-resort percent extractor for tools that print a bare 'NN.N%' with
-    no elapsed/remaining/rate fields (e.g. `resize2fs -p`)."""
+    """Last-resort percent extractor for tools that print a bare 'NN.N%'
+    with no elapsed/remaining/rate fields, or (confirmed live) resize2fs
+    -p's dash/X text bar instead of any digit percentage at all."""
     m = _PERCENT_ONLY_RE.search(line)
-    return float(m[1]) if m else None
+    if m:
+        return float(m[1])
+    bar = _RESIZE2FS_BAR_RE.match(line)
+    if bar:
+        filled = bar[1]
+        return 100.0 * filled.count("X") / len(filled)
+    return None
 
 
 @dataclass
@@ -510,7 +524,12 @@ class Stage:
 # partclone.restore call — its own live % resets at each new "Restoring
 # Partition N:" line rather than tracking a partition count up front.
 RESTORE_STAGES = [
-    Stage("Restoring partition table", "Restoring the first", measurable=False, weight=0.05),
+    # "$ rescuezilla restore ..." is the literal argv echo run_streaming
+    # prints for every command it runs (log(f"$ {' '.join(args)}")) — since
+    # we build that argv ourselves, this line is 100% under our control and
+    # can never be reworded by a future rescuezilla release the way its own
+    # wrapper prose ("Restoring the first...") could be.
+    Stage("Restoring partition table", "$ rescuezilla restore", measurable=False, weight=0.05),
     Stage("Restoring partitions", "Restoring Partition", measurable=True, weight=0.60),
     Stage("Growing partition", "Growing partition", measurable=False, weight=0.10),
     Stage("Resizing filesystem", "Resizing filesystem", measurable=True, weight=0.20),
@@ -527,14 +546,19 @@ RESTORE_STAGES = [
 # its start marker.
 BACKUP_STAGES = [
     Stage("Shrinking partition", "Shrinking filesystem", measurable=True, weight=0.10),
-    # "Backing up Partition" is inferred by symmetry with the confirmed restore-side
-    # "Restoring Partition N: ... to ..." wrapper text (vmtest/serial.log:675) — the
-    # real backup run's console output wasn't captured (it was redirected to a file
-    # instead of the serial console). The GUI-side stage tracker also advances here
-    # on the first partclone progress line regardless, so a wrong marker string
-    # degrades to "detected one stage late" rather than "stuck" — still, confirm
-    # and fix this string against a real backup run during VM testing.
-    Stage("Backing up partitions", "Backing up Partition", measurable=True, weight=0.65),
+    # Same "$ <argv>" echo trick as restore's first stage, and for the same
+    # reason: an earlier guess here based on the wrapper's own per-partition
+    # prose ("Backing up Partition", by wrong-guessed symmetry with
+    # restore's confirmed "Restoring Partition N:" text) simply never
+    # matched real output — confirmed live, the actual line is "Backup
+    # /dev/sdaN containing filesystem ext4 to .../sdaN.ext4-ptcl-img.gz."
+    # — leaving the stage tracker stuck on "Shrinking partition" for the
+    # entire backup no matter how far partclone actually got. Matching our
+    # own echoed argv instead needs no wrapper-wording guess at all, and
+    # fires right as the backup command starts (a beat before the first
+    # partition's own line, which reads fine — backup's own hardware-info
+    # gathering happens first anyway).
+    Stage("Backing up partitions", "$ rescuezilla backup", measurable=True, weight=0.65),
     Stage("Checksumming", "Checksumming", measurable=False, weight=0.10),
     Stage("Restoring source size", "Restoring the source disk's partition", measurable=True, weight=0.15),
 ]
@@ -1086,10 +1110,30 @@ def _self_check():
     assert parse_partclone_progress("just some unrelated log line") is None
     assert parse_percent_only("   50.0%") == 50.0
     assert parse_percent_only("no percent here") is None
+    # Real line captured off a live resize2fs -p run — half-filled bar.
+    half_bar = "Relocating blocks             " + "-" * 40 + "X" * 40
+    assert parse_percent_only(half_bar) == 50.0, parse_percent_only(half_bar)
+    full_bar = "Scanning inode table          " + "X" * 80
+    assert parse_percent_only(full_bar) == 100.0
+    assert parse_percent_only("Begin pass 2 (max = 3035716)") is None
 
     for name, stages in (("RESTORE_STAGES", RESTORE_STAGES), ("BACKUP_STAGES", BACKUP_STAGES)):
         total = sum(s.weight for s in stages)
         assert abs(total - 1.0) < 1e-9, f"{name} weights sum to {total}, not 1.0"
+
+    # Stage markers that use our own argv echo must actually match the real
+    # line run_streaming prints for that exact command — this is the whole
+    # point of using them over the wrapper's own (guessable, changeable)
+    # prose, so a regression here would be exactly the kind of silent
+    # stage-tracker breakage this self-check exists to catch.
+    restore_cmd_line = "$ " + " ".join(
+        ["rescuezilla", "restore", "--source", "/mnt/ventoy/restoreimg",
+         "--destination", "/dev/sda", "--overwrite-partition-table"])
+    assert RESTORE_STAGES[0].start_marker in restore_cmd_line
+    backup_cmd_line = "$ " + " ".join(
+        ["rescuezilla", "backup", "--source", "/dev/sda",
+         "--destination", "/mnt/ventoy/restoreimg", "--compression-format", "gzip"])
+    assert BACKUP_STAGES[1].start_marker in backup_cmd_line
 
     cancel_event = threading.Event()
     threading.Timer(0.3, cancel_event.set).start()
