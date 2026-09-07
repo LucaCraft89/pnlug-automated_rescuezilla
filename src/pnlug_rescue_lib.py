@@ -545,9 +545,9 @@ STAGE_MARKERS = [
 
 @dataclass
 class PartcloneProgress:
-    elapsed_s: int
-    remaining_s: int
     percent: float
+    elapsed_s: Optional[int] = None
+    remaining_s: Optional[int] = None
     rate: str = ""  # e.g. "6.94GB/min" — empty when partclone hasn't computed one yet
 
 
@@ -560,6 +560,20 @@ class PartcloneProgress:
 _PARTCLONE_RE = re.compile(
     r"Elapsed:\s*(\d+):(\d+):(\d+),\s*Remaining:\s*(\d+):(\d+):(\d+),\s*"
     r"Completed:\s*([\d.]+)%,\s*(?:Rate:\s*)?([\d.]+[^\s,]*)"
+)
+# The OTHER live progress format partclone prints for some partition/tool
+# combinations (confirmed live in a real restore log, e.g. small FAT/swap
+# partitions) — no elapsed/remaining/rate at all, just block counts and a
+# percentage, and rescuezilla's own wrapper doesn't recognize this one
+# either (it forwards the raw line as-is, sometimes prefixed
+# "Not yet interpreting partclone output: "):
+#   "Current block:          0, Total block:     614376, Complete:   0.00%[A"
+# This used to fall through to the generic _PERCENT_ONLY_RE below, which
+# works but is one loose regex away from matching an unrelated "NN%" on
+# some other line during the same stage — parsing this format by name
+# instead is the direct fix the percentage-tracking complaint asked for.
+_PARTCLONE_BLOCK_RE = re.compile(
+    r"Current block:\s*\d+,\s*Total block:\s*\d+,\s*Complete:\s*([\d.]+)%"
 )
 # Fallback for tools with no elapsed/remaining/rate, just a trailing percentage
 # (e.g. `resize2fs -p`) — used only to drive a stage's own %, no speed/ETA.
@@ -579,14 +593,17 @@ def _hms_to_seconds(h: str, m: str, s: str) -> int:
 
 def parse_partclone_progress(line: str) -> Optional[PartcloneProgress]:
     m = _PARTCLONE_RE.search(line)
-    if not m:
-        return None
-    return PartcloneProgress(
-        elapsed_s=_hms_to_seconds(*m.group(1, 2, 3)),
-        remaining_s=_hms_to_seconds(*m.group(4, 5, 6)),
-        percent=float(m.group(7)),
-        rate=m.group(8),
-    )
+    if m:
+        return PartcloneProgress(
+            elapsed_s=_hms_to_seconds(*m.group(1, 2, 3)),
+            remaining_s=_hms_to_seconds(*m.group(4, 5, 6)),
+            percent=float(m.group(7)),
+            rate=m.group(8),
+        )
+    m = _PARTCLONE_BLOCK_RE.search(line)
+    if m:
+        return PartcloneProgress(percent=float(m.group(1)))
+    return None
 
 
 def parse_percent_only(line: str) -> Optional[float]:
@@ -1047,6 +1064,56 @@ def _shrink_btrfs(sys_part: str, disk: str, log: LogFn,
     return StepResult(True, f"Shrunk {sys_part} to ~20G before backup.", changed=True)
 
 
+# Directories the next boot's initramfs needs to already exist on the root
+# filesystem so it has something to mount devtmpfs/proc/sysfs/tmpfs onto.
+_ESSENTIAL_DIRS = ("dev", "proc", "sys", "run", "tmp")
+
+
+def _create_missing_essential_dirs(root_path: str, log: LogFn) -> list[str]:
+    """Pure part of ensure_essential_directories: given an already-mounted
+    root's path, create any of _ESSENTIAL_DIRS that are missing. Returns
+    the names actually created (empty list = nothing was wrong). Split out
+    from the mount handling below so this core logic is unit-testable
+    without a real block device."""
+    created = []
+    for name in _ESSENTIAL_DIRS:
+        path = os.path.join(root_path, name)
+        if not os.path.isdir(path):
+            log(f"WARNING: restored system is missing /{name} — creating it "
+                f"(without it, the restored system cannot boot).")
+            os.makedirs(path, mode=0o755, exist_ok=True)
+            created.append(name)
+    return created
+
+
+def ensure_essential_directories(disk: str, log: LogFn = _noop_log) -> None:
+    """Best-effort post-restore check: mount the restored system partition
+    and make sure /dev, /proc, /sys, /run, /tmp exist on it, creating any
+    that are missing.
+
+    Confirmed live: a restore left the root filesystem without a /dev
+    directory, and the very next boot kernel-panicked before anything
+    could even run (fixed by hand with a manual `mkdir /dev` from a
+    chroot). The exact upstream cause (rescuezilla's own restore, or
+    partclone itself) isn't confirmed, but there's no safe way to boot
+    without these directories, so we verify and repair them ourselves
+    rather than trust the clone blindly. Any failure here (partition not
+    found, can't mount) is swallowed — this is a belt-and-suspenders check
+    that runs after restore() has already determined its own real
+    success/failure."""
+    sys_part = find_system_partition(disk)
+    if not sys_part:
+        return
+    _ensure_partition_free(sys_part)
+    with tempfile.TemporaryDirectory() as mnt:
+        if _run(["mount", resolve_mountable(sys_part), mnt]).returncode != 0:
+            return
+        try:
+            _create_missing_essential_dirs(mnt, log)
+        finally:
+            _unmount_retry(mnt)
+
+
 def restore(restoreimg_path: str, disk: str, log: LogFn = _noop_log,
             cancel_event: Optional[threading.Event] = None) -> StepResult:
     log(f"Restoring {restoreimg_path} to {disk}...")
@@ -1072,6 +1139,8 @@ def restore(restoreimg_path: str, disk: str, log: LogFn = _noop_log,
     # moments later in check_restored_filesystem(). udevadm settle blocks
     # until pending udev events are processed, closing the race.
     _run(["udevadm", "settle", "--timeout=10"])
+
+    ensure_essential_directories(disk, log)
 
     try:
         grow = grow_system_partition(disk, log, cancel_event=cancel_event)
@@ -1208,6 +1277,17 @@ def _self_check():
     assert p2 and p2.percent == 100.0 and p2.rate == "6.94GB/min", p2
 
     assert parse_partclone_progress("just some unrelated log line") is None
+
+    # Real line captured off a live restore log — the *other* partclone
+    # progress format (small FAT/swap partitions), which rescuezilla's own
+    # wrapper doesn't recognize either and just forwards raw.
+    p3 = parse_partclone_progress(
+        "Not yet interpreting partclone output: Current block:          0, "
+        "Total block:     614376, Complete:   0.00%[A")
+    assert p3 and p3.percent == 0.0 and p3.elapsed_s is None and p3.remaining_s is None, p3
+    p4 = parse_partclone_progress("Current block:      15488, Total block:     614376, Complete: 100.00%")
+    assert p4 and p4.percent == 100.0, p4
+
     assert parse_percent_only("   50.0%") == 50.0
     assert parse_percent_only("no percent here") is None
     # Real line captured off a live resize2fs -p run — half-filled bar.
@@ -1263,6 +1343,18 @@ def _self_check():
     except OperationAborted:
         pass
     assert len(lines) < 15, f"cancel should have cut this off well before 20 ticks, got {len(lines)}"
+
+    # ensure_essential_directories' core logic, without needing a real
+    # mounted partition — confirmed live this matters: a restore left the
+    # root filesystem without /dev, and the next boot kernel-panicked.
+    with tempfile.TemporaryDirectory() as fake_root:
+        os.makedirs(os.path.join(fake_root, "proc"))  # one already present
+        created = _create_missing_essential_dirs(fake_root, _noop_log)
+        assert set(created) == set(_ESSENTIAL_DIRS) - {"proc"}, created
+        for name in _ESSENTIAL_DIRS:
+            assert os.path.isdir(os.path.join(fake_root, name)), name
+        # Second pass: everything already exists now, nothing to create.
+        assert _create_missing_essential_dirs(fake_root, _noop_log) == []
 
     print("pnlug_rescue_lib self-check OK")
 

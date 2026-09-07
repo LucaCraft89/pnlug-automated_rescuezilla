@@ -312,7 +312,8 @@ class ProgressPage(Gtk.Box):
         percent = None
         if pc:
             percent = pc.percent
-            self._remaining_samples.append(pc.remaining_s)
+            if pc.remaining_s is not None:
+                self._remaining_samples.append(pc.remaining_s)
             if pc.rate:
                 self._last_rate = pc.rate
         elif stage.measurable:
