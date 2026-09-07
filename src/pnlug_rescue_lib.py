@@ -779,6 +779,12 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log,
         return _fail_with_tail(f"Failed to resize partition {sys_part}.", tail)
 
     _run(["partprobe", disk])
+    # Same race as restore()'s own partprobe call (see the comment there):
+    # blkid immediately after partprobe can come back empty because udev
+    # hasn't caught up to the new partition size yet — confirmed live, this
+    # was reported as "Unsupported filesystem type ''" right after a
+    # successful resizepart on a real, unquestionably-ext4 partition.
+    _run(["udevadm", "settle", "--timeout=10"])
     r = _run(["blkid", "-o", "value", "-s", "TYPE", sys_part])
     fs_type = r.stdout.strip()
     log(f"Resizing filesystem on {sys_part} (detected: {fs_type})...")
