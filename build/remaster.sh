@@ -106,6 +106,18 @@ if ! grep -q "pnlug-autostart.sh" "$OPENBOX_AUTOSTART" 2>/dev/null; then
     printf '\n# PNLUG Rescue (see /usr/bin/pnlug-autostart.sh)\n/usr/bin/pnlug-autostart.sh &\n' >> "$OPENBOX_AUTOSTART"
 fi
 
+# Stock Rescuezilla's own /home/ubuntu/.xprofile ends with `rescuezilla &`,
+# auto-launching its own welcome-wizard GUI on every login — alongside ours.
+# Confirmed live: with both open, clicking around the stock wizard can leave
+# a stray rescuezillapy helper process running, which then makes our own
+# restore/backup fail outright with "Only one rescuezillapy process is
+# permitted." Strip that line so only the PNLUG-branded flow appears.
+XPROFILE="$SQROOT/home/ubuntu/.xprofile"
+if [ -f "$XPROFILE" ]; then
+    sed -i '/^rescuezilla &$/d' "$XPROFILE"
+    grep -q '^rescuezilla &$' "$XPROFILE" && { echo "stock rescuezilla autostart line survived the sed — .xprofile changed, needs a look." >&2; exit 1; }
+fi
+
 # Desktop shortcuts: every real user home already on the image, plus
 # /etc/skel so any home created fresh at login gets them too.
 for desktop_dir in "$SQROOT"/etc/skel "$SQROOT"/home/*; do

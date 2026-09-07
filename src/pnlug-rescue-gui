@@ -60,7 +60,9 @@ class RescueWindow(Gtk.Window):
         spinner = Gtk.Spinner()
         spinner.start()
         box.pack_start(spinner, False, False, 0)
-        self.detect_label = Gtk.Label(label="Looking for a Rescuezilla backup on the Ventoy drive...")
+        self.detect_label = Gtk.Label(
+            label="Looking for a Rescuezilla backup on the Ventoy drive...\n"
+                  "(this can take a minute or two right after boot)")
         box.pack_start(self.detect_label, False, False, 0)
         self.stack.add_named(box, "detect")
 

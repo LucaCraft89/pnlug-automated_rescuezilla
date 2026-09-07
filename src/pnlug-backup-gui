@@ -61,7 +61,9 @@ class BackupWindow(Gtk.Window):
         spinner = Gtk.Spinner()
         spinner.start()
         box.pack_start(spinner, False, False, 0)
-        self.detect_label = Gtk.Label(label="Looking for the Ventoy drive to back up onto...")
+        self.detect_label = Gtk.Label(
+            label="Looking for the Ventoy drive to back up onto...\n"
+                  "(this can take a minute or two right after boot)")
         box.pack_start(self.detect_label, False, False, 0)
         self.stack.add_named(box, "detect")
 

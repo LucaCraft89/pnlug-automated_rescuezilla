@@ -205,13 +205,27 @@ def resolve_mountable(partition_path: str) -> str:
     """Real Ventoy sticks, booted through the full live desktop, turn out to
     wrap their data partition in a device-mapper node of the *same* base
     name (confirmed empirically: /dev/sdb1 comes back "already mounted or
-    mount point busy" while /dev/mapper/sdb1 mounts fine and shows the real
+    mount point busy" while the dm node mounts fine and shows the real
     contents) — apparently Ventoy's own runtime claims the raw partition.
-    Prefer the mapper node when one exists."""
+
+    Prefer the mapper node when one exists — but confirmed live in testing
+    that the /dev/mapper/<name> *symlink* is non-deterministic: `dmsetup ls`
+    and the /dev/dm-N block device it names are always there the moment the
+    dm target is created, but the udev rule that's supposed to symlink
+    /dev/mapper/<name> to it doesn't always fire (seen it appear on some
+    boots, never appear on others, `udevadm settle` doesn't help — it's not
+    a pending-event race, the symlink is just never generated). Falling back
+    to `dmsetup info` to resolve the real /dev/dm-N directly means this
+    doesn't depend on that symlink ever showing up at all."""
     name = os.path.basename(partition_path)
     mapper_path = f"/dev/mapper/{name}"
     if os.path.exists(mapper_path):
         return mapper_path
+    minor = _run(["dmsetup", "info", "-c", "--noheadings", "-o", "minor", name]).stdout.strip()
+    if minor.isdigit():
+        dm_path = f"/dev/dm-{minor}"
+        if os.path.exists(dm_path):
+            return dm_path
     return partition_path
 
 
@@ -220,7 +234,7 @@ def looks_like_ventoy_partition(mountpoint: str) -> bool:
             or os.path.isfile(os.path.join(mountpoint, "ventoy", "ventoy.json")))
 
 
-def find_ventoy_partition(retries: int = 3, retry_delay: float = 1.0) -> Optional[str]:
+def find_ventoy_partition(retries: int = 300, retry_delay: float = 1.0) -> Optional[str]:
     """Scan real partitions for Ventoy markers (restoreimg/, ventoy/ventoy.json).
     Returns the partition device path, or None.
 
@@ -230,6 +244,22 @@ def find_ventoy_partition(retries: int = 3, retry_delay: float = 1.0) -> Optiona
     a single mount attempt fail with "already mounted or busy" even though
     the very same mount succeeds moments later. This matters most for
     autostart, which fires at exactly that moment.
+
+    Confirmed live (matters enough to call out): even 60 retries at 1s
+    (~60s) wasn't always enough — at real autostart time the device-mapper
+    node Ventoy wraps the partition in (see resolve_mountable) can itself
+    take minutes to appear under load (toram is also busy copying the
+    whole squashfs into RAM at the same moment), not just its
+    /dev/mapper/<name> symlink; caught a real boot where `dmsetup ls`
+    still didn't show it yet a full minute in, but
+    resolve_mountable+find_ventoy_partition resolved it correctly the
+    moment it was tried again later. The whole point of autostart is
+    walking straight to disk selection with zero clicks, and this runs on
+    a background thread behind a spinner — it costs nothing when the stick
+    resolves in the usual 1-2s, so this errs very generous (300 retries,
+    ~5 minutes worst case) rather than risk dumping the user into a raw
+    filesystem browser they don't know how to use. Only a genuinely
+    missing/broken stick ever waits out the full ceiling.
 
     A candidate already mounted somewhere is checked at its *existing*
     mountpoint rather than skipped outright: confirmed in testing that the
