@@ -147,6 +147,38 @@ def _unmount_retry(mnt: str, attempts: int = 3, delay: float = 0.5) -> None:
     _run(["umount", "-l", mnt])  # lazy: detach now, finishes once nothing's using it
 
 
+def _inspect_mounted_partition(part: str, check_fn: Callable[[str], Optional[object]],
+                                scratch_mnt: str) -> Optional[object]:
+    """Run `check_fn(mountpoint)` against `part`, mounting it read-only at
+    `scratch_mnt` first if it isn't already mounted somewhere.
+
+    Confirmed live on real hardware: a partition can be mounted by
+    something entirely outside our control at the exact moment we go
+    looking — e.g. rescuezilla's own post-restore chroot-test mount at
+    /tmp/root_reinst.XXXXXX, which its own cleanup can fail to unmount
+    (confirmed in the same run: "rmdir: failed to remove
+    '/tmp/root_reinst.XXXXXX': Device or resource busy", right where its
+    own log shows it trying). A first version of find_system_partition
+    (and detect_distro_name) just skipped "already mounted" candidates
+    outright — meaning the *one* partition we actually cared about was
+    silently never inspected, and restore()'s own post-restore auto-grow
+    and sanity check both reported "Could not identify a Linux system
+    partition" right after a restore that had just visibly succeeded.
+    find_ventoy_partition already handled this correctly; this makes both
+    of the other two do the same instead of guessing why they can't
+    identify what's plainly right there."""
+    target = resolve_mountable(part)
+    existing = _run(["findmnt", "-n", "-o", "TARGET", target])
+    if existing.returncode == 0:
+        return check_fn(existing.stdout.strip().splitlines()[0])
+    if _run(["mount", "-o", "ro", target, scratch_mnt]).returncode != 0:
+        return None
+    try:
+        return check_fn(scratch_mnt)
+    finally:
+        _unmount_retry(scratch_mnt)
+
+
 def detect_distro_name(disk_path: str) -> str:
     """Best-effort distro name off a disk, read from /etc/os-release
     (PRETTY_NAME) on whichever partition has one. Empty string if none
@@ -154,20 +186,21 @@ def detect_distro_name(disk_path: str) -> str:
     r = _run(["lsblk", "-lnpo", "NAME,TYPE", disk_path])
     parts = [line.split()[0] for line in r.stdout.splitlines()
              if len(line.split()) == 2 and line.split()[1] == "part"]
+
+    def read_pretty_name(mountpoint: str) -> Optional[str]:
+        os_release = os.path.join(mountpoint, "etc", "os-release")
+        if not os.path.isfile(os_release):
+            return None
+        with open(os_release, errors="replace") as f:
+            content = f.read()
+        m = re.search(r'^PRETTY_NAME="?([^"\n]+)"?', content, re.MULTILINE)
+        return m[1].strip() if m else None
+
     with tempfile.TemporaryDirectory() as mnt:
         for part in parts:
-            if _run(["mount", "-o", "ro", resolve_mountable(part), mnt]).returncode != 0:
-                continue
-            try:
-                os_release = os.path.join(mnt, "etc", "os-release")
-                if os.path.isfile(os_release):
-                    with open(os_release, errors="replace") as f:
-                        content = f.read()
-                    m = re.search(r'^PRETTY_NAME="?([^"\n]+)"?', content, re.MULTILINE)
-                    if m:
-                        return m[1].strip()
-            finally:
-                _unmount_retry(mnt)
+            name = _inspect_mounted_partition(part, read_pretty_name, mnt)
+            if name:
+                return name
     return ""
 
 
@@ -343,18 +376,16 @@ def find_system_partition(disk: str) -> Optional[str]:
     parts = [line.split()[0] for line in r.stdout.splitlines()
              if len(line.split()) == 2 and line.split()[1] == "part"]
 
+    def looks_like_system_partition(mountpoint: str) -> bool:
+        has_fstab = os.path.isfile(os.path.join(mountpoint, "etc", "fstab"))
+        has_bin = (os.path.isdir(os.path.join(mountpoint, "usr", "bin"))
+                   or os.path.isdir(os.path.join(mountpoint, "bin")))
+        return has_fstab and has_bin
+
     with tempfile.TemporaryDirectory() as mnt:
         for part in parts:
-            if _run(["mount", "-o", "ro", resolve_mountable(part), mnt]).returncode != 0:
-                continue
-            try:
-                has_fstab = os.path.isfile(os.path.join(mnt, "etc", "fstab"))
-                has_bin = (os.path.isdir(os.path.join(mnt, "usr", "bin"))
-                           or os.path.isdir(os.path.join(mnt, "bin")))
-                if has_fstab and has_bin:
-                    return part
-            finally:
-                _unmount_retry(mnt)
+            if _inspect_mounted_partition(part, looks_like_system_partition, mnt):
+                return part
     return None
 
 
