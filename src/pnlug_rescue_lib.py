@@ -18,6 +18,7 @@ Single source of truth for the GUI and TUI front-ends.
 import glob
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -313,7 +314,15 @@ def is_last_partition(part: str, disk: str) -> bool:
 def get_source_min_bytes(restoreimg_path: str) -> Optional[int]:
     """Minimum destination size (bytes) implied by the backup's own saved
     partition table dump (e.g. restoreimg/vda-pt.sf). None if it can't tell
-    (older/unexpected backup format)."""
+    at all (empty/unreadable dump).
+
+    Confirmed live in testing: not every sfdisk -d dump includes a
+    `last-lba:` summary line (depends on sfdisk version/options at backup
+    time) — a dump with only per-partition start=/size= lines used to make
+    this return None, silently turning off the destination-size check
+    instead of blocking an undersized restore. Falls back to the furthest
+    partition end (same start=/size= parsing is_last_partition already
+    relies on) whenever last-lba is missing."""
     try:
         with open(os.path.join(restoreimg_path, "disk")) as f:
             diskname = f.read().strip()
@@ -321,11 +330,17 @@ def get_source_min_bytes(restoreimg_path: str) -> Optional[int]:
             sf = f.read()
     except OSError:
         return None
+    sector_size_m = re.search(r"^sector-size:\s*(\d+)", sf, re.MULTILINE)
+    sector_size = int(sector_size_m[1]) if sector_size_m else 512
+
     last_lba = re.search(r"^last-lba:\s*(\d+)", sf, re.MULTILINE)
-    sector_size = re.search(r"^sector-size:\s*(\d+)", sf, re.MULTILINE)
-    if not (last_lba and sector_size):
-        return None
-    return (int(last_lba[1]) + 1) * int(sector_size[1])
+    if last_lba:
+        return (int(last_lba[1]) + 1) * sector_size
+    # _SFDISK_LINE's ^ anchor is per-line (matched line-by-line elsewhere, e.g.
+    # is_last_partition) rather than re.MULTILINE — walk sf the same way.
+    matches = (_SFDISK_LINE.match(line) for line in sf.splitlines())
+    ends = [int(m["start"]) + int(m["size"]) for m in matches if m]
+    return max(ends) * sector_size if ends else None
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +377,99 @@ STAGE_MARKERS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Fine-grained stage/percentage tracking (GTK GUI only — see Stage below).
+# TUI keeps using the flat STAGE_MARKERS list above; not touched here.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PartcloneProgress:
+    elapsed_s: int
+    remaining_s: int
+    percent: float
+    rate: str = ""  # e.g. "6.94GB/min" — empty when partclone hasn't computed one yet
+
+
+# partclone's own live progress line, confirmed against real captured output
+# (vmtest/serial.log), e.g.:
+#   "Elapsed: 00:00:01, Remaining: 00:01:39, Completed:   1.00%,   0.00byte/min,"
+#   "Elapsed: 00:00:02, Remaining: 00:00:00, Completed: 100.00%, Rate:   6.94GB/min,"
+# The "Rate:" label itself is sometimes missing (first line, before partclone
+# has computed one) — the regex tolerates that.
+_PARTCLONE_RE = re.compile(
+    r"Elapsed:\s*(\d+):(\d+):(\d+),\s*Remaining:\s*(\d+):(\d+):(\d+),\s*"
+    r"Completed:\s*([\d.]+)%,\s*(?:Rate:\s*)?([\d.]+[^\s,]*)"
+)
+# Fallback for tools with no elapsed/remaining/rate, just a trailing percentage
+# (e.g. `resize2fs -p`) — used only to drive a stage's own %, no speed/ETA.
+_PERCENT_ONLY_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+
+
+def _hms_to_seconds(h: str, m: str, s: str) -> int:
+    return int(h) * 3600 + int(m) * 60 + int(s)
+
+
+def parse_partclone_progress(line: str) -> Optional[PartcloneProgress]:
+    m = _PARTCLONE_RE.search(line)
+    if not m:
+        return None
+    return PartcloneProgress(
+        elapsed_s=_hms_to_seconds(*m.group(1, 2, 3)),
+        remaining_s=_hms_to_seconds(*m.group(4, 5, 6)),
+        percent=float(m.group(7)),
+        rate=m.group(8),
+    )
+
+
+def parse_percent_only(line: str) -> Optional[float]:
+    """Last-resort percent extractor for tools that print a bare 'NN.N%' with
+    no elapsed/remaining/rate fields (e.g. `resize2fs -p`)."""
+    m = _PERCENT_ONLY_RE.search(line)
+    return float(m[1]) if m else None
+
+
+@dataclass
+class Stage:
+    label: str
+    start_marker: str   # substring in the log that begins this stage
+    measurable: bool     # True if the tool driving it reports a live percentage
+    weight: float         # this stage's share of the overall progress bar
+
+
+# Ordered restore stages. "Restoring partitions" covers every per-partition
+# partclone.restore call — its own live % resets at each new "Restoring
+# Partition N:" line rather than tracking a partition count up front.
+RESTORE_STAGES = [
+    Stage("Restoring partition table", "Restoring the first", measurable=False, weight=0.05),
+    Stage("Restoring partitions", "Restoring Partition", measurable=True, weight=0.60),
+    Stage("Growing partition", "Growing partition", measurable=False, weight=0.10),
+    Stage("Resizing filesystem", "Resizing filesystem", measurable=True, weight=0.20),
+    # "Successfully restored image partition" (the run_streaming success_marker)
+    # fires *before* grow/resize, not after — chronologically it belongs inside
+    # "Restoring partitions" above, not as a final stage. The real last thing
+    # that happens is check_restored_filesystem's own log line.
+    Stage("Finishing up", "Sanity-checking", measurable=False, weight=0.05),
+]
+
+# Ordered backup stages. "Restoring source size" only actually runs when the
+# pre-backup shrink changed something (StepResult.changed) — the GUI marks it
+# "skipped" rather than stuck-pending when a run finishes without ever hitting
+# its start marker.
+BACKUP_STAGES = [
+    Stage("Shrinking partition", "Shrinking filesystem", measurable=True, weight=0.10),
+    # "Backing up Partition" is inferred by symmetry with the confirmed restore-side
+    # "Restoring Partition N: ... to ..." wrapper text (vmtest/serial.log:675) — the
+    # real backup run's console output wasn't captured (it was redirected to a file
+    # instead of the serial console). The GUI-side stage tracker also advances here
+    # on the first partclone progress line regardless, so a wrong marker string
+    # degrades to "detected one stage late" rather than "stuck" — still, confirm
+    # and fix this string against a real backup run during VM testing.
+    Stage("Backing up partitions", "Backing up Partition", measurable=True, weight=0.65),
+    Stage("Checksumming", "Checksumming", measurable=False, weight=0.10),
+    Stage("Restoring source size", "Restoring the source disk's partition", measurable=True, weight=0.15),
+]
+
+
 def check_destination_size(restoreimg_path: str, disk: Disk) -> StepResult:
     min_bytes = get_source_min_bytes(restoreimg_path)
     if min_bytes is None:
@@ -376,7 +484,16 @@ def check_destination_size(restoreimg_path: str, disk: Disk) -> StepResult:
 TAIL_LINES = 12  # how much context to fold into a failure message — see run_streaming
 
 
-def run_streaming(args, log: LogFn, success_marker: str = None, stdin_text: str = None) -> tuple[int, list[str]]:
+class OperationAborted(Exception):
+    """Raised out of run_streaming when abort_check() fires mid-command —
+    caught once at the top of restore()/backup() and turned into a StepResult.
+    A best-effort mid-write cancel, not a clean rollback: whatever the killed
+    command was doing (writing a partition, resizing a filesystem) is left
+    exactly as far as it got."""
+
+
+def run_streaming(args, log: LogFn, success_marker: str = None, stdin_text: str = None,
+                   abort_check: Callable[[], Optional[str]] = None) -> tuple[int, list[str]]:
     """Run a command, streaming stdout+stderr line-by-line into `log`.
     Returns (exit_code, last_few_lines) — the tail is for building a
     specific failure message (verbose, not just "it failed") without the
@@ -411,7 +528,12 @@ def run_streaming(args, log: LogFn, success_marker: str = None, stdin_text: str 
     itself finished and exited — that hung our whole app indefinitely.
     Waiting on the real process instead, then giving the reader a couple
     seconds to drain, fixes it without caring who else might be holding
-    stdout open."""
+    stdout open.
+
+    `abort_check`, when given, is polled roughly every 0.3s from a separate
+    watcher thread (so it fires even during a long stretch with no output,
+    e.g. a slow btrfs resize) — a truthy return value kills the process and
+    raises OperationAborted with that value as the reason."""
     log(f"$ {' '.join(args)}")
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              stdin=subprocess.PIPE if stdin_text is not None else None,
@@ -420,6 +542,7 @@ def run_streaming(args, log: LogFn, success_marker: str = None, stdin_text: str 
         proc.stdin.write(stdin_text)
         proc.stdin.close()
     saw_marker = False
+    aborted_reason = None
     tail = deque(maxlen=TAIL_LINES)
 
     def reader():
@@ -434,15 +557,33 @@ def run_streaming(args, log: LogFn, success_marker: str = None, stdin_text: str 
         except (ValueError, OSError):
             pass  # stdout got closed out from under us while draining below — fine, we're done either way
 
+    def watcher():
+        nonlocal aborted_reason
+        while proc.poll() is None:
+            reason = abort_check()
+            if reason:
+                aborted_reason = reason
+                proc.kill()
+                return
+            time.sleep(0.3)
+
     reader_thread = threading.Thread(target=reader, daemon=True)
     reader_thread.start()
+    watcher_thread = None
+    if abort_check:
+        watcher_thread = threading.Thread(target=watcher, daemon=True)
+        watcher_thread.start()
     proc.wait()
     reader_thread.join(timeout=2)  # drain whatever output was already buffered
+    if watcher_thread:
+        watcher_thread.join(timeout=1)
     try:
         proc.stdout.close()  # unstick the reader thread if something else is still holding the pipe open
     except OSError:
         pass
 
+    if aborted_reason:
+        raise OperationAborted(aborted_reason)
     rc = 0 if saw_marker else proc.returncode
     return rc, list(tail)
 
@@ -456,7 +597,18 @@ def _fail_with_tail(headline: str, tail: list[str]) -> StepResult:
     return StepResult(False, headline)
 
 
-def grow_system_partition(disk: str, log: LogFn = _noop_log) -> StepResult:
+def _make_abort_check(cancel_event: Optional[threading.Event]) -> Optional[Callable[[], Optional[str]]]:
+    """Turn a plain threading.Event into the abort_check callback run_streaming
+    expects — shared by every cancellable step below so "check cancel_event"
+    logic exists exactly once."""
+    if not cancel_event:
+        return None
+    return lambda: "Cancelled by user" if cancel_event.is_set() else None
+
+
+def grow_system_partition(disk: str, log: LogFn = _noop_log,
+                           cancel_event: Optional[threading.Event] = None) -> StepResult:
+    abort_check = _make_abort_check(cancel_event)
     sys_part = find_system_partition(disk)
     if not sys_part:
         return StepResult(False, "Could not identify a Linux system partition — restore succeeded, "
@@ -469,7 +621,8 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log) -> StepResult:
 
     partition_num = sys_part[len(disk):].lstrip("p")
     log(f"Growing partition {partition_num} ({sys_part}) to use all available space...")
-    rc, tail = run_streaming(["parted", "-s", "--", disk, "resizepart", partition_num, "100%"], log)
+    rc, tail = run_streaming(["parted", "-s", "--", disk, "resizepart", partition_num, "100%"], log,
+                              abort_check=abort_check)
     if rc != 0:
         return _fail_with_tail(f"Failed to resize partition {sys_part}.", tail)
 
@@ -479,13 +632,15 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log) -> StepResult:
     log(f"Resizing filesystem on {sys_part} (detected: {fs_type})...")
 
     if fs_type in ("ext2", "ext3", "ext4"):
-        run_streaming(["e2fsck", "-f", "-p", sys_part], log)
-        rc, tail = run_streaming(["resize2fs", sys_part], log)
+        run_streaming(["e2fsck", "-f", "-p", sys_part], log, abort_check=abort_check)
+        # -p: print percentage completion, so the GUI can track this stage live too.
+        rc, tail = run_streaming(["resize2fs", "-p", sys_part], log, abort_check=abort_check)
         ok = rc == 0
     elif fs_type == "btrfs":
         with tempfile.TemporaryDirectory() as tmp:
             if _run(["mount", sys_part, tmp]).returncode == 0:
-                rc, tail = run_streaming(["btrfs", "filesystem", "resize", "max", tmp], log)
+                rc, tail = run_streaming(["btrfs", "filesystem", "resize", "max", tmp], log,
+                                          abort_check=abort_check)
                 ok = rc == 0
             else:
                 ok, tail = False, []
@@ -493,7 +648,7 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log) -> StepResult:
     elif fs_type == "xfs":
         with tempfile.TemporaryDirectory() as tmp:
             if _run(["mount", sys_part, tmp]).returncode == 0:
-                rc, tail = run_streaming(["xfs_growfs", tmp], log)
+                rc, tail = run_streaming(["xfs_growfs", tmp], log, abort_check=abort_check)
                 ok = rc == 0
             else:
                 ok, tail = False, []
@@ -506,13 +661,40 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log) -> StepResult:
     return _fail_with_tail("Partition was resized but filesystem resize failed.", tail)
 
 
+def check_restored_filesystem(disk: str, log: LogFn = _noop_log) -> StepResult:
+    """Post-restore sanity check: re-identify the system partition and run a
+    read-only filesystem check on it, so a corrupt clone is reported instead
+    of silently trusted. Never touches anything (-n/--readonly throughout) —
+    this is a report, not a repair."""
+    sys_part = find_system_partition(disk)
+    if not sys_part:
+        return StepResult(True, "Could not identify a Linux system partition to sanity-check.")
+    fs_type = _run(["blkid", "-o", "value", "-s", "TYPE", sys_part]).stdout.strip()
+    log(f"Sanity-checking {sys_part} (detected: {fs_type})...")
+
+    if fs_type in ("ext2", "ext3", "ext4"):
+        rc, tail = run_streaming(["e2fsck", "-fn", sys_part], log)
+    elif fs_type == "btrfs":
+        rc, tail = run_streaming(["btrfs", "check", "--readonly", sys_part], log)
+    elif fs_type == "xfs":
+        rc, tail = run_streaming(["xfs_repair", "-n", sys_part], log)
+    else:
+        return StepResult(True, f"Unsupported filesystem type '{fs_type}' — skipping post-restore check.")
+
+    if rc == 0:
+        return StepResult(True, f"Post-restore check: {sys_part} looks clean.")
+    return _fail_with_tail(f"Post-restore check found problems on {sys_part} — the restore likely still "
+                            "worked, but verify manually (e.g. with gparted) before relying on this disk.", tail)
+
+
 SHRINK_TARGET_BYTES = 20 * 1024 * 1024 * 1024  # 20G — see shrink_system_partition_for_backup
 SHRINK_MARGIN_FRACTION = 0.15  # headroom above the filesystem's reported minimum
 SHRINK_MARGIN_MIN_BYTES = 512 * 1024 * 1024
 PARTITION_END_BUFFER_BYTES = 16 * 1024 * 1024  # alignment/safety slack past the shrunk filesystem
 
 
-def shrink_system_partition_for_backup(disk: str, log: LogFn = _noop_log) -> StepResult:
+def shrink_system_partition_for_backup(disk: str, log: LogFn = _noop_log,
+                                        cancel_event: Optional[threading.Event] = None) -> StepResult:
     """Before backing a disk up, shrink its Linux system partition to 20G —
     or as close to that as the filesystem's actual data allows, whichever
     is bigger — so the backup image is smaller and faster (this is the
@@ -536,12 +718,66 @@ def shrink_system_partition_for_backup(disk: str, log: LogFn = _noop_log) -> Ste
     fs_type = _run(["blkid", "-o", "value", "-s", "TYPE", sys_part]).stdout.strip()
 
     if fs_type in ("ext2", "ext3", "ext4"):
-        return _shrink_ext(sys_part, disk, log)
+        return _shrink_ext(sys_part, disk, log, cancel_event=cancel_event)
     if fs_type == "btrfs":
-        return _shrink_btrfs(sys_part, disk, log)
+        return _shrink_btrfs(sys_part, disk, log, cancel_event=cancel_event)
     if fs_type == "xfs":
         return StepResult(True, "XFS does not support shrinking — skipping pre-backup shrink.")
     return StepResult(True, f"Unsupported filesystem type '{fs_type}' — skipping pre-backup shrink.")
+
+
+def _ext4_minimum_bytes(sys_part: str) -> Optional[int]:
+    """Minimum size (bytes) `resize2fs` reports an ext2/3/4 filesystem could
+    shrink to, i.e. roughly how much real data is on it. Shared by the actual
+    shrink (_shrink_ext) and by check_backup_space's dry-run estimate — same
+    regex/block-size logic, computed once."""
+    _, tail = run_streaming(["resize2fs", "-P", sys_part], _noop_log)
+    m = re.search(r"minimum size.*?:\s*(\d+)", "\n".join(tail), re.IGNORECASE)
+    if not m:
+        return None
+    block_size = 4096
+    bs = _run(["dumpe2fs", "-h", sys_part])
+    bm = re.search(r"^Block size:\s*(\d+)", bs.stdout, re.MULTILINE)
+    if bm:
+        block_size = int(bm[1])
+    return int(m[1]) * block_size
+
+
+LOW_SPACE_FLOOR_BYTES = 256 * 1024 * 1024  # abort a backup if the destination drops below this — see backup()
+
+
+def check_backup_space(source_disk: str, destination_folder: str) -> StepResult:
+    """Pre-flight check mirroring check_destination_size: does the source
+    disk's actual data plausibly fit in whatever free space the destination
+    has? Only ext2/3/4 can be estimated cheaply (see _ext4_minimum_bytes) —
+    btrfs/xfs/unknown fall back to "can't verify", same non-blocking pattern
+    check_destination_size uses for an unrecognised backup format."""
+    sys_part = find_system_partition(source_disk)
+    if not sys_part:
+        return StepResult(True, "Could not verify backup size (no Linux system partition identified).")
+    fs_type = _run(["blkid", "-o", "value", "-s", "TYPE", sys_part]).stdout.strip()
+    if fs_type not in ("ext2", "ext3", "ext4"):
+        return StepResult(True, "Could not verify backup size against free space (unsupported filesystem type).")
+
+    minimum_bytes = _ext4_minimum_bytes(sys_part)
+    if minimum_bytes is None:
+        return StepResult(True, "Could not verify backup size against free space (couldn't read filesystem usage).")
+    margin = max(int(minimum_bytes * SHRINK_MARGIN_FRACTION), SHRINK_MARGIN_MIN_BYTES)
+    needed_bytes = minimum_bytes + margin
+
+    dest_check_path = destination_folder if os.path.isdir(destination_folder) else (
+        os.path.dirname(destination_folder.rstrip("/")) or "/")
+    try:
+        free_bytes = shutil.disk_usage(dest_check_path).free
+    except OSError:
+        return StepResult(True, "Could not verify free space at the backup destination.")
+
+    if free_bytes < needed_bytes:
+        needed = needed_bytes // (1024 * 1024)
+        have = free_bytes // (1024 * 1024)
+        return StepResult(False, f"Not enough free space at the backup destination for {sys_part} "
+                                  f"({have}MiB free < ~{needed}MiB needed).")
+    return StepResult(True)
 
 
 def _shrink_partition_to(sys_part: str, disk: str, new_fs_bytes: int, log: LogFn) -> bool:
@@ -567,20 +803,12 @@ def _shrink_partition_to(sys_part: str, disk: str, new_fs_bytes: int, log: LogFn
     return True
 
 
-def _shrink_ext(sys_part: str, disk: str, log: LogFn) -> StepResult:
-    run_streaming(["e2fsck", "-f", "-p", sys_part], log)  # resize2fs requires a clean fs
+def _shrink_ext(sys_part: str, disk: str, log: LogFn,
+                 cancel_event: Optional[threading.Event] = None) -> StepResult:
+    abort_check = _make_abort_check(cancel_event)
+    run_streaming(["e2fsck", "-f", "-p", sys_part], log, abort_check=abort_check)  # resize2fs requires a clean fs
 
-    _, tail = run_streaming(["resize2fs", "-P", sys_part], log)
-    minimum_bytes = None
-    m = re.search(r"minimum size.*?:\s*(\d+)", "\n".join(tail), re.IGNORECASE)
-    block_size = 4096
-    bs = _run(["dumpe2fs", "-h", sys_part])
-    bm = re.search(r"^Block size:\s*(\d+)", bs.stdout, re.MULTILINE)
-    if bm:
-        block_size = int(bm[1])
-    if m:
-        minimum_bytes = int(m[1]) * block_size
-
+    minimum_bytes = _ext4_minimum_bytes(sys_part)
     if minimum_bytes is None:
         return StepResult(True, f"Couldn't determine the minimum size of {sys_part} — skipping pre-backup shrink.")
 
@@ -594,7 +822,9 @@ def _shrink_ext(sys_part: str, disk: str, log: LogFn) -> StepResult:
 
     log(f"Shrinking filesystem on {sys_part} to {target_bytes // (1024**3)}G "
         f"(minimum possible: {minimum_bytes // (1024**3)}G)...")
-    rc, tail = run_streaming(["resize2fs", sys_part, f"{target_bytes // (1024*1024)}M"], log)
+    # -p: print percentage completion, so the GUI can track this stage live too.
+    rc, tail = run_streaming(["resize2fs", "-p", sys_part, f"{target_bytes // (1024*1024)}M"], log,
+                              abort_check=abort_check)
     if rc != 0:
         return _fail_with_tail(f"Could not shrink the filesystem on {sys_part} — proceeding at its current size.",
                                 tail)
@@ -603,7 +833,8 @@ def _shrink_ext(sys_part: str, disk: str, log: LogFn) -> StepResult:
     return StepResult(True, f"Shrunk {sys_part} to ~{target_bytes // (1024**3)}G before backup.", changed=True)
 
 
-def _shrink_btrfs(sys_part: str, disk: str, log: LogFn) -> StepResult:
+def _shrink_btrfs(sys_part: str, disk: str, log: LogFn,
+                   cancel_event: Optional[threading.Event] = None) -> StepResult:
     # btrfs has no direct "minimum size" query; attempt the 20G target
     # directly and accept that btrfs itself refuses if actual data won't
     # fit — that failure is expected and not a real problem.
@@ -612,7 +843,8 @@ def _shrink_btrfs(sys_part: str, disk: str, log: LogFn) -> StepResult:
             return StepResult(True, f"Could not mount {sys_part} to shrink it — skipping pre-backup shrink.")
         try:
             rc, tail = run_streaming(["btrfs", "filesystem", "resize",
-                                       str(SHRINK_TARGET_BYTES // (1024*1024)) + "M", tmp], log)
+                                       str(SHRINK_TARGET_BYTES // (1024*1024)) + "M", tmp], log,
+                                      abort_check=_make_abort_check(cancel_event))
         finally:
             _run(["umount", tmp])
     if rc != 0:
@@ -621,11 +853,17 @@ def _shrink_btrfs(sys_part: str, disk: str, log: LogFn) -> StepResult:
     return StepResult(True, f"Shrunk {sys_part} to ~20G before backup.", changed=True)
 
 
-def restore(restoreimg_path: str, disk: str, log: LogFn = _noop_log) -> StepResult:
+def restore(restoreimg_path: str, disk: str, log: LogFn = _noop_log,
+            cancel_event: Optional[threading.Event] = None) -> StepResult:
     log(f"Restoring {restoreimg_path} to {disk}...")
-    rc, tail = run_streaming(["rescuezilla", "restore", "--source", restoreimg_path,
-                              "--destination", disk, "--overwrite-partition-table"], log,
-                             success_marker="Successfully restored image partition")
+    try:
+        rc, tail = run_streaming(["rescuezilla", "restore", "--source", restoreimg_path,
+                                  "--destination", disk, "--overwrite-partition-table"], log,
+                                 success_marker="Successfully restored image partition",
+                                 abort_check=_make_abort_check(cancel_event))
+    except OperationAborted as exc:
+        return StepResult(False, f"Restore cancelled ({exc}). The disk may be left partially written — "
+                                  "do not treat this as a working system.")
     if rc != 0:
         return _fail_with_tail(
             "Restore failed. The disk may be left partially written — do not treat this as a working system.",
@@ -633,10 +871,17 @@ def restore(restoreimg_path: str, disk: str, log: LogFn = _noop_log) -> StepResu
     log("Restore reported success.")
     _run(["partprobe", disk])
 
-    grow = grow_system_partition(disk, log)
-    if grow.ok:
-        return StepResult(True, "Restore done, system partition grown to fill the disk.")
-    return StepResult(True, f"Restore succeeded, but: {grow.message}")
+    try:
+        grow = grow_system_partition(disk, log, cancel_event=cancel_event)
+    except OperationAborted as exc:
+        return StepResult(True, f"Restore succeeded, but growing the partition was cancelled ({exc}) — "
+                                 "you can grow it manually with gparted.")
+    message = ("Restore done, system partition grown to fill the disk." if grow.ok
+               else f"Restore succeeded, but: {grow.message}")
+
+    check = check_restored_filesystem(disk, log)
+    message += f"\n\n{check.message}" if not check.ok else f" {check.message}"
+    return StepResult(True, message)
 
 
 # ---------------------------------------------------------------------------
@@ -651,9 +896,50 @@ def describe_disk_for_backup(disk: "Disk") -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", disk.distro).strip("_") if disk.distro else ""
 
 
+def _make_backup_abort_check(cancel_event: Optional[threading.Event],
+                              destination_folder: str) -> Callable[[], Optional[str]]:
+    """abort_check for the main backup command: cancel button OR the
+    destination running low on space mid-write (checked once per output
+    line — see run_streaming's watcher). destination_folder may not exist
+    yet (rescuezilla creates it), so free space is checked on its parent."""
+    check_path = destination_folder if os.path.isdir(destination_folder) else (
+        os.path.dirname(destination_folder.rstrip("/")) or "/")
+
+    def check() -> Optional[str]:
+        if cancel_event and cancel_event.is_set():
+            return "Cancelled by user"
+        try:
+            free = shutil.disk_usage(check_path).free
+        except OSError:
+            return None
+        if free < LOW_SPACE_FLOOR_BYTES:
+            return f"destination ran low on space (under {LOW_SPACE_FLOOR_BYTES // (1024*1024)}MiB free)"
+        return None
+
+    return check
+
+
+def _try_regrow_after_cancel(source_disk: str, log: LogFn) -> None:
+    """Best-effort attempt to restore the source disk's partition to full
+    size after a cancel landed mid-shrink, where we don't know how far the
+    shrink actually got. Safe to call even if nothing was shrunk at all —
+    grow_system_partition is a no-op on an already-full-size partition.
+    ponytail: doesn't try to resume the *specific* shrink step that was
+    interrupted, just re-grows from scratch; good enough since shrink/grow
+    are already idempotent in each direction."""
+    try:
+        grow_system_partition(source_disk, log)
+    except OperationAborted:
+        pass  # user is cancelling everything; don't fight them on the regrow too
+
+
 def backup(source_disk: str, destination_folder: str, log: LogFn = _noop_log,
-           description: str = "") -> StepResult:
-    shrink = shrink_system_partition_for_backup(source_disk, log)
+           description: str = "", cancel_event: Optional[threading.Event] = None) -> StepResult:
+    try:
+        shrink = shrink_system_partition_for_backup(source_disk, log, cancel_event=cancel_event)
+    except OperationAborted as exc:
+        _try_regrow_after_cancel(source_disk, log)
+        return StepResult(False, f"Backup cancelled before it started ({exc}).")
     log(shrink.message)
 
     args = ["rescuezilla", "backup", "--source", source_disk,
@@ -662,17 +948,22 @@ def backup(source_disk: str, destination_folder: str, log: LogFn = _noop_log,
     # (verified in Phase 1 testing) — only pass it if it's a single token.
     if description and " " not in description:
         args += ["--description", description]
-    rc, tail = run_streaming(args, log)
-    # Same stock-wrapper exit-code bug as restore() (confirmed in testing):
-    # a real backup can finish (clonezilla-img written and checksummed) and
-    # still return nonzero because of the wrapper's own unrelated cleanup
-    # bug. Checking the actual output file is simpler and more robust here
-    # than hunting for a specific log line.
-    image_file = os.path.join(destination_folder, "clonezilla-img")
-    if rc != 0 and not (os.path.isfile(image_file) and os.path.getsize(image_file) > 0):
-        result = _fail_with_tail("Backup failed.", tail)
+    try:
+        rc, tail = run_streaming(args, log, abort_check=_make_backup_abort_check(cancel_event, destination_folder))
+    except OperationAborted as exc:
+        result = StepResult(False, f"Backup cancelled ({exc}). The backup at {destination_folder} "
+                                    "is incomplete — delete it before trying again.")
     else:
-        result = StepResult(True, "Backup completed successfully.")
+        # Same stock-wrapper exit-code bug as restore() (confirmed in testing):
+        # a real backup can finish (clonezilla-img written and checksummed) and
+        # still return nonzero because of the wrapper's own unrelated cleanup
+        # bug. Checking the actual output file is simpler and more robust here
+        # than hunting for a specific log line.
+        image_file = os.path.join(destination_folder, "clonezilla-img")
+        if rc != 0 and not (os.path.isfile(image_file) and os.path.getsize(image_file) > 0):
+            result = _fail_with_tail("Backup failed.", tail)
+        else:
+            result = StepResult(True, "Backup completed successfully.")
 
     # The shrink above is only ever meant to make a smaller/faster backup —
     # it must never leave the machine we just backed up any different than
@@ -682,7 +973,14 @@ def backup(source_disk: str, destination_folder: str, log: LogFn = _noop_log,
     # succeeded, since we still altered the source disk either way.
     if shrink.changed:
         log("Restoring the source disk's partition to its original size...")
-        regrow = grow_system_partition(source_disk, log)
+        try:
+            regrow = grow_system_partition(source_disk, log, cancel_event=cancel_event)
+        except OperationAborted as exc:
+            warning = (f"IMPORTANT: cancelled while restoring the source disk's original size ({exc}). "
+                       f"The source machine's disk is now smaller than before this backup — grow it back "
+                       f"manually (e.g. with gparted) before considering this done.")
+            log(warning)
+            return StepResult(False, (result.message + "\n\n" + warning).strip())
         if regrow.ok:
             log("Source disk restored to its original size.")
         else:
@@ -694,3 +992,40 @@ def backup(source_disk: str, destination_folder: str, log: LogFn = _noop_log,
             result = StepResult(result.ok, (result.message + "\n\n" + warning).strip())
 
     return result
+
+
+def _self_check():
+    """No block-device access needed — covers the pure-logic parts that the
+    GUI's progress tracker depends on: progress-line parsing, stage weights
+    summing to 1.0, and run_streaming's cancel mechanism actually killing a
+    running process. Run directly: `python3 pnlug_rescue_lib.py`."""
+    p = parse_partclone_progress("Elapsed: 00:00:01, Remaining: 00:01:39, Completed:   1.00%,   0.00byte/min,")
+    assert p and p.elapsed_s == 1 and p.remaining_s == 99 and p.percent == 1.0 and p.rate == "0.00byte/min", p
+
+    p2 = parse_partclone_progress("Elapsed: 00:00:02, Remaining: 00:00:00, Completed: 100.00%, Rate:   6.94GB/min,")
+    assert p2 and p2.percent == 100.0 and p2.rate == "6.94GB/min", p2
+
+    assert parse_partclone_progress("just some unrelated log line") is None
+    assert parse_percent_only("   50.0%") == 50.0
+    assert parse_percent_only("no percent here") is None
+
+    for name, stages in (("RESTORE_STAGES", RESTORE_STAGES), ("BACKUP_STAGES", BACKUP_STAGES)):
+        total = sum(s.weight for s in stages)
+        assert abs(total - 1.0) < 1e-9, f"{name} weights sum to {total}, not 1.0"
+
+    cancel_event = threading.Event()
+    threading.Timer(0.3, cancel_event.set).start()
+    lines = []
+    try:
+        run_streaming(["bash", "-c", "for i in $(seq 1 20); do echo tick $i; sleep 0.2; done"],
+                       lines.append, abort_check=_make_abort_check(cancel_event))
+        raise AssertionError("expected OperationAborted, cancel was never honored")
+    except OperationAborted:
+        pass
+    assert len(lines) < 15, f"cancel should have cut this off well before 20 ticks, got {len(lines)}"
+
+    print("pnlug_rescue_lib self-check OK")
+
+
+if __name__ == "__main__":
+    _self_check()

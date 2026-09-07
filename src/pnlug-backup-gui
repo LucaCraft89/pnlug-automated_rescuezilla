@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import threading
+import traceback
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -47,7 +48,7 @@ class BackupWindow(Gtk.Window):
         self._build_browse_page()
         self._build_disks_page()
 
-        self.progress_page = gui.ProgressPage()
+        self.progress_page = gui.ProgressPage(lib.BACKUP_STAGES)
         self.stack.add_named(self.progress_page, "progress")
 
         self.stack.set_visible_child_name("detect")
@@ -141,6 +142,10 @@ class BackupWindow(Gtk.Window):
         if not row:
             return
         disk = row.disk
+        space_check = lib.check_backup_space(disk.path, self.destination)
+        if not space_check.ok:
+            gui.error_dialog(self, space_check.message)
+            return
         replacing = os.path.isdir(self.destination)
         extra = f"Backup destination: {self.destination}"
         if replacing:
@@ -148,18 +153,19 @@ class BackupWindow(Gtk.Window):
         if not gui.confirm_dialog(self, f"Back up {disk.path}?", disk, extra):
             return
         self.stack.set_visible_child_name("progress")
-        threading.Thread(target=self._backup_worker, args=(disk,), daemon=True).start()
+        cancel_event = self.progress_page.begin()
+        threading.Thread(target=self._backup_worker, args=(disk, cancel_event), daemon=True).start()
 
     # -------------------------------------------------------------- worker
-    def _backup_worker(self, disk: "lib.Disk"):
+    def _backup_worker(self, disk: "lib.Disk", cancel_event):
         try:
             if os.path.isdir(self.destination):
                 self.progress_page.log_threadsafe(f"Removing existing backup at {self.destination}...")
                 shutil.rmtree(self.destination)
             result = lib.backup(disk.path, self.destination, log=self.progress_page.log_threadsafe,
-                                 description=lib.describe_disk_for_backup(disk))
+                                 description=lib.describe_disk_for_backup(disk), cancel_event=cancel_event)
         except Exception as exc:  # noqa: BLE001 - last-resort guard, never crash silently
-            self.progress_page.log_threadsafe(f"Unexpected error: {exc}")
+            self.progress_page.log_threadsafe(f"Unexpected error: {exc}\n{traceback.format_exc()}")
             result = lib.StepResult(False, f"Unexpected error: {exc}")
         GLib.idle_add(self._on_backup_done, result)
 

@@ -15,6 +15,7 @@ Design (see /home/luca/.claude/plans/synchronous-spinning-tiger.md, Phase 2):
 import os
 import sys
 import threading
+import traceback
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -46,7 +47,7 @@ class RescueWindow(Gtk.Window):
         self._build_browse_page()
         self._build_disks_page()
 
-        self.progress_page = gui.ProgressPage()
+        self.progress_page = gui.ProgressPage(lib.RESTORE_STAGES)
         self.stack.add_named(self.progress_page, "progress")
 
         self.stack.set_visible_child_name("detect")
@@ -152,14 +153,16 @@ class RescueWindow(Gtk.Window):
                                    "All data currently on this disk will be permanently lost."):
             return
         self.stack.set_visible_child_name("progress")
-        threading.Thread(target=self._restore_worker, args=(disk,), daemon=True).start()
+        cancel_event = self.progress_page.begin()
+        threading.Thread(target=self._restore_worker, args=(disk, cancel_event), daemon=True).start()
 
     # -------------------------------------------------------------- worker
-    def _restore_worker(self, disk: "lib.Disk"):
+    def _restore_worker(self, disk: "lib.Disk", cancel_event):
         try:
-            result = lib.restore(self.restoreimg_path, disk.path, log=self.progress_page.log_threadsafe)
+            result = lib.restore(self.restoreimg_path, disk.path, log=self.progress_page.log_threadsafe,
+                                  cancel_event=cancel_event)
         except Exception as exc:  # noqa: BLE001 - last-resort guard, never crash silently
-            self.progress_page.log_threadsafe(f"Unexpected error: {exc}")
+            self.progress_page.log_threadsafe(f"Unexpected error: {exc}\n{traceback.format_exc()}")
             result = lib.StepResult(False, f"Unexpected error: {exc}")
         GLib.idle_add(self._on_restore_done, result)
 

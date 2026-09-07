@@ -1,3 +1,14 @@
 build/output/
 __pycache__/
 *.pyc
+
+# Disposable local test/scratch artifacts (VM images, screendumps, zips,
+# extracted ISOs) — see CLAUDE.md's Testing methodology section, this rig
+# is intentionally never checked in.
+vmtest/
+extracted/
+*.iso
+*.zip
+src/*.log
+src/*.ppm
+src/vmout.txt
