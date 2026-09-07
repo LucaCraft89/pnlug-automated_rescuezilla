@@ -147,6 +147,40 @@ def _unmount_retry(mnt: str, attempts: int = 3, delay: float = 0.5) -> None:
     _run(["umount", "-l", mnt])  # lazy: detach now, finishes once nothing's using it
 
 
+def _unmount_tree(mountpoint: str) -> None:
+    """Unmount `mountpoint` and everything mounted underneath it, deepest
+    first. Needed because rescuezilla's own post-restore chroot-test mount
+    (/tmp/root_reinst.XXXXXX) bind-mounts /sys and /sys/firmware/efi/efivars
+    inside it and its own cleanup can leave all three mounted (confirmed
+    live, repeatedly) — a plain umount on just the top mountpoint fails
+    with "target is busy" as long as those submounts are still there."""
+    r = _run(["findmnt", "-R", "-n", "-o", "TARGET", mountpoint])
+    targets = r.stdout.strip().splitlines() if r.returncode == 0 and r.stdout.strip() else [mountpoint]
+    for target in sorted(targets, key=len, reverse=True):  # deepest path first
+        _unmount_retry(target)
+
+
+def _ensure_partition_free(part: str) -> None:
+    """If `part` is currently mounted anywhere, unmount it (and any nested
+    submounts) before a parted/sfdisk call that needs the kernel to apply a
+    partition table change to it.
+
+    Confirmed live: rescuezilla's own post-restore chroot-test step mounts
+    the just-restored system partition at a scratch path and its cleanup
+    can fail to unmount it. find_system_partition/detect_distro_name were
+    already made tolerant of that for *reading* (see
+    _inspect_mounted_partition), but growing the partition is a write:
+    `parted resizepart` printed "Partition /dev/sda2 is being used" and,
+    with the kernel unable to apply the new size while busy, updated the
+    on-disk partition table without the filesystem/kernel view following —
+    the resize looked like it ran, but a follow-up fsck still saw the old
+    (pre-grow) geometry. Unmounting first avoids that silent mismatch."""
+    target = resolve_mountable(part)
+    existing = _run(["findmnt", "-n", "-o", "TARGET", target])
+    if existing.returncode == 0:
+        _unmount_tree(existing.stdout.strip().splitlines()[0])
+
+
 def _inspect_mounted_partition(part: str, check_fn: Callable[[str], Optional[object]],
                                 scratch_mnt: str) -> Optional[object]:
     """Run `check_fn(mountpoint)` against `part`, mounting it read-only at
@@ -771,6 +805,7 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log,
         return StepResult(False, f"{sys_part} has no free space after it on {disk} to grow into — "
                                   "restore succeeded, but there's nothing extra to reclaim.")
 
+    _ensure_partition_free(sys_part)
     partition_num = sys_part[len(disk):].lstrip("p")
     log(f"Growing partition {partition_num} ({sys_part}) to use all available space...")
     rc, tail = run_streaming(["parted", "-s", "--", disk, "resizepart", partition_num, target_end], log,
@@ -948,6 +983,7 @@ def _shrink_partition_to(sys_part: str, disk: str, new_fs_bytes: int, log: LogFn
     seemingly not a bypassable confirmation in script mode at all. sfdisk's
     `-N <num>` (change just one partition's size, keeping its start) has no
     such gate and resizes cleanly non-interactively."""
+    _ensure_partition_free(sys_part)
     partition_num = sys_part[len(disk):].lstrip("p")
     new_size_mib = (new_fs_bytes + PARTITION_END_BUFFER_BYTES) // (1024 * 1024)
     log(f"Shrinking partition {partition_num} to {new_size_mib}MiB...")
