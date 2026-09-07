@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,6 +29,28 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 LogFn = Callable[[str], None]
+
+
+def ensure_root():
+    """Re-exec this process under sudo if it isn't already root. Confirmed
+    live on real hardware — a bug this codebase never actually exercised
+    before, since every prior test happened to relaunch these tools from an
+    already-root terminal: none of the four ways a user can start these
+    tools (autostart, or any of the three Desktop shortcuts) elevate
+    privileges at all, so every real operation in this module (mount,
+    parted, sfdisk, resize2fs, ...) was silently failing on a genuine
+    unprivileged desktop login. It looked exactly like "can't find/mount
+    the Ventoy drive" — every candidate partition fails to mount, instantly,
+    every retry, forever — with nothing to say it was a permissions problem
+    and not a missing/slow drive.
+
+    `sudo -E` preserves DISPLAY/XAUTHORITY so a re-exec'd GTK window still
+    shows up on the same X session; `-n` fails fast with a clear error
+    instead of hanging on a password prompt with no TTY to answer it on, if
+    the live user's sudo ever isn't passwordless."""
+    if os.geteuid() == 0:
+        return
+    os.execvp("sudo", ["sudo", "-n", "-E", sys.executable] + sys.argv)
 
 
 def _run(args, **kw):

@@ -2,7 +2,8 @@
     "control":[
         { "VTOY_DEFAULT_KBD_LAYOUT": "ITALIANO" },
         { "VTOY_MENU_TIMEOUT": "3" },
-        { "VTOY_DEFAULT_IMAGE": "/pnlug_zilla.iso" }
+        { "VTOY_DEFAULT_IMAGE": "/pnlug_zilla.iso" },
+        { "VTOY_SECONDARY_BOOT_MENU": "0" }
     ],
     "theme":{
         "file": "/ventoy/theme/pnlug/theme.txt",

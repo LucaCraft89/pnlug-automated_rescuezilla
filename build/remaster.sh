@@ -143,9 +143,14 @@ GRUB_CFG="$ISOTREE/boot/grub/grub.cfg"
 sed -i \
     -e 's/set default="en-item>standard-start-item"/set default="en-item>load-into-ram-item"/' \
     -e 's/\btoram\b \(fsck\.mode=skip\)/toram noeject \1/' \
+    -e 's/^set timeout=10$/set timeout=1/' \
     "$GRUB_CFG"
 grep -q 'default="en-item>load-into-ram-item"' "$GRUB_CFG" || { echo "grub.cfg default entry not found — Rescuezilla changed its menu, needs a look." >&2; exit 1; }
 grep -q 'toram noeject' "$GRUB_CFG" || { echo "grub.cfg toram entry not found — Rescuezilla changed its menu, needs a look." >&2; exit 1; }
+# The stock 10s timeout here is what makes the whole language->load-into-ram
+# chain auto-drill on its own (confirmed live) — just slower than it needs to
+# be for a stick with exactly one thing it's ever going to boot.
+grep -q '^set timeout=1$' "$GRUB_CFG" || { echo "grub.cfg timeout=10 line not found — Rescuezilla changed its menu, needs a look." >&2; exit 1; }
 
 echo "==> Repacking squashfs..."
 rm -f "$SQUASHFS"

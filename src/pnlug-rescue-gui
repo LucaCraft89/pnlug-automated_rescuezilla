@@ -23,6 +23,7 @@ from gi.repository import Gtk, GLib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pnlug_rescue_lib as lib
+lib.ensure_root()
 import pnlug_gui_common as gui
 
 
