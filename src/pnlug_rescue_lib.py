@@ -363,22 +363,48 @@ _SFDISK_LINE = re.compile(
 )
 
 
-def is_last_partition(part: str, disk: str) -> bool:
-    """True if `part` is physically the last partition on `disk` (i.e. it's
-    the only one that could safely grow into trailing free space). Uses
-    `sfdisk -d`, same format the backups themselves are saved in."""
+def _sfdisk_entries(disk: str) -> list[tuple[str, int, int]]:
+    """[(dev, start_sector, end_sector_inclusive), ...] from `sfdisk -d`."""
     r = _run(["sfdisk", "-d", disk])
-    part_end = -1
-    max_end = -1
+    entries = []
     for line in r.stdout.splitlines():
         m = _SFDISK_LINE.match(line)
-        if not m:
-            continue
-        end = int(m["start"]) + int(m["size"])
-        if m["dev"] == part:
-            part_end = end
-        max_end = max(max_end, end)
-    return part_end >= 0 and part_end == max_end
+        if m:
+            start = int(m["start"])
+            entries.append((m["dev"], start, start + int(m["size"]) - 1))
+    return entries
+
+
+def _grow_target_end_from_entries(entries: list[tuple[str, int, int]], part: str) -> Optional[str]:
+    """parted resizepart END argument to grow `part` as far as it safely
+    can: the disk's own end ("100%") if nothing at all follows it, or the
+    exact sector just before whichever partition starts next otherwise.
+
+    Confirmed live on a real machine (not a bug in growing itself — this
+    function used to not exist at all): the old is_last_partition() check
+    refused to grow anything unless it was *literally* the last partition
+    on the disk, even when the space right after it was genuine unallocated
+    free space with nothing in it — e.g. a swap partition placed after
+    root, which is a completely ordinary layout, not an edge case. A real
+    backup's own regrow-after-shrink step hit exactly this and gave up,
+    leaving the source disk permanently smaller with a large chunk of now
+    only-gparted-reachable free space. None if there's no room to grow
+    into at all (this partition already reaches right up to the next one,
+    or the next one starts at the very next sector)."""
+    part_end = next((end for dev, start, end in entries if dev == part), None)
+    if part_end is None:
+        return None
+    later_starts = [start for dev, start, end in entries if dev != part and start > part_end]
+    if not later_starts:
+        return "100%"
+    next_start = min(later_starts)
+    if next_start - part_end <= 1:
+        return None
+    return f"{next_start - 1}s"
+
+
+def _grow_target_end(part: str, disk: str) -> Optional[str]:
+    return _grow_target_end_from_entries(_sfdisk_entries(disk), part)
 
 
 def get_source_min_bytes(restoreimg_path: str) -> Optional[int]:
@@ -407,7 +433,7 @@ def get_source_min_bytes(restoreimg_path: str) -> Optional[int]:
     if last_lba:
         return (int(last_lba[1]) + 1) * sector_size
     # _SFDISK_LINE's ^ anchor is per-line (matched line-by-line elsewhere, e.g.
-    # is_last_partition) rather than re.MULTILINE — walk sf the same way.
+    # _sfdisk_entries) rather than re.MULTILINE — walk sf the same way.
     matches = (_SFDISK_LINE.match(line) for line in sf.splitlines())
     ends = [int(m["start"]) + int(m["size"]) for m in matches if m]
     return max(ends) * sector_size if ends else None
@@ -709,13 +735,14 @@ def grow_system_partition(disk: str, log: LogFn = _noop_log,
                                   "but auto-grow was skipped. You can grow partitions manually with gparted.")
     log(f"Identified Linux system partition: {sys_part}")
 
-    if not is_last_partition(sys_part, disk):
-        return StepResult(False, f"{sys_part} is not the last partition on {disk} (something else follows it) — "
-                                  "restore succeeded, but the extra space isn't safely reachable.")
+    target_end = _grow_target_end(sys_part, disk)
+    if target_end is None:
+        return StepResult(False, f"{sys_part} has no free space after it on {disk} to grow into — "
+                                  "restore succeeded, but there's nothing extra to reclaim.")
 
     partition_num = sys_part[len(disk):].lstrip("p")
     log(f"Growing partition {partition_num} ({sys_part}) to use all available space...")
-    rc, tail = run_streaming(["parted", "-s", "--", disk, "resizepart", partition_num, "100%"], log,
+    rc, tail = run_streaming(["parted", "-s", "--", disk, "resizepart", partition_num, target_end], log,
                               abort_check=abort_check)
     if rc != 0:
         return _fail_with_tail(f"Failed to resize partition {sys_part}.", tail)
@@ -1116,6 +1143,24 @@ def _self_check():
     full_bar = "Scanning inode table          " + "X" * 80
     assert parse_percent_only(full_bar) == 100.0
     assert parse_percent_only("Begin pass 2 (max = 3035716)") is None
+
+    # Exact real layout from a live machine: root (sda2) with swap (sda3)
+    # placed right after it — root2 is not the *last* partition, but there
+    # was a huge unallocated gap after it that the old is_last_partition
+    # check refused to touch at all.
+    real_entries = [
+        ("/dev/sda1", 4096, 4096 + 614400 - 1),
+        ("/dev/sda2", 618496, 618496 + 41975808 - 1),
+        ("/dev/sda3", 461674273, 461674273 + 26722829 - 1),
+    ]
+    assert _grow_target_end_from_entries(real_entries, "/dev/sda2") == "461674272s"
+    # Genuinely last partition -> grow to the disk's own end.
+    assert _grow_target_end_from_entries(real_entries, "/dev/sda3") == "100%"
+    # No entries at all for the requested partition.
+    assert _grow_target_end_from_entries(real_entries, "/dev/sda9") is None
+    # Already touching the next partition — nothing to grow into.
+    tight_entries = [("/dev/sda1", 0, 99), ("/dev/sda2", 100, 199)]
+    assert _grow_target_end_from_entries(tight_entries, "/dev/sda1") is None
 
     for name, stages in (("RESTORE_STAGES", RESTORE_STAGES), ("BACKUP_STAGES", BACKUP_STAGES)):
         total = sum(s.weight for s in stages)
